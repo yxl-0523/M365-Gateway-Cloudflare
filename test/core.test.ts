@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { chatHubUpdateHasSemanticProgress } from "../src/chathub";
-import { publicFailure, responsesContinuationOutputIssue } from "../src/openai";
+import { observeStreamBackpressure, publicFailure, responsesContinuationOutputIssue } from "../src/openai";
 import { RequestMetricTracker } from "../src/request-metrics";
 import { guardProposedToolCalls, parseChatToolLedger } from "../src/tool-ledger";
 import { createUpstreamGateLifecycle } from "../src/upstream-lifecycle";
@@ -103,6 +103,14 @@ describe("tool-loop continuation", () => {
 });
 
 describe("upstream cancellation lifecycle", () => {
+  it("expires only after sustained downstream backpressure", () => {
+    expect(observeStreamBackpressure(0, 1, 1_000, 15_000)).toEqual({ blockedSince: 0, expired: false });
+    expect(observeStreamBackpressure(0, 0, 1_000, 15_000)).toEqual({ blockedSince: 1_000, expired: false });
+    expect(observeStreamBackpressure(1_000, 0, 15_999, 15_000)).toEqual({ blockedSince: 1_000, expired: false });
+    expect(observeStreamBackpressure(1_000, 0, 16_000, 15_000)).toEqual({ blockedSince: 1_000, expired: true });
+    expect(observeStreamBackpressure(1_000, 1, 16_000, 15_000)).toEqual({ blockedSince: 0, expired: false });
+  });
+
   it("releases a gate acquired immediately after cancellation exactly once", async () => {
     const released: string[] = [];
     const lifecycle = createUpstreamGateLifecycle({

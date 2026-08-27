@@ -38,6 +38,7 @@ import {
 const encoder = new TextEncoder();
 const STREAM_HEARTBEAT_MS = 5_000;
 const STREAM_PREFLIGHT_GRACE_MS = 250;
+const STREAM_BACKPRESSURE_TIMEOUT_MS = 15_000;
 const LOGICAL_REQUEST_TIMEOUT_MS = 10 * 60_000;
 const DEFAULT_REQUEST_TOKEN_BUDGET = 96_000;
 const PROMPT_PROTOCOL_RESERVE_TOKENS = 2_048;
@@ -93,6 +94,17 @@ function observeMetricResult(metrics: RequestMetricTracker | undefined, result: 
 
 export function logicalRequestDeadlineAt(now = Date.now()): number {
   return now + LOGICAL_REQUEST_TIMEOUT_MS;
+}
+
+export function observeStreamBackpressure(
+  blockedSince: number,
+  desiredSize: number | null,
+  now = Date.now(),
+  timeoutMs = STREAM_BACKPRESSURE_TIMEOUT_MS,
+): { blockedSince: number; expired: boolean } {
+  if (desiredSize === null || desiredSize > 0) return { blockedSince: 0, expired: false };
+  const since = blockedSince || now;
+  return { blockedSince: since, expired: now - since >= timeoutMs };
 }
 
 /**
@@ -1853,10 +1865,20 @@ function chatStream(
   const cancellation = createStreamCancellation(state, session, lease, downstreamSignal);
   let closed = false;
   let heartbeat: ReturnType<typeof setInterval> | undefined;
+  let backpressuredAt = 0;
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
       const send = (value: unknown): void => {
         if (closed) return;
+        const pressure = observeStreamBackpressure(backpressuredAt, controller.desiredSize);
+        backpressuredAt = pressure.blockedSince;
+        if (pressure.expired) {
+          closed = true;
+          if (heartbeat) clearInterval(heartbeat);
+          void metrics?.cancel(200);
+          cancellation.scheduleAbortAndRelease();
+          return;
+        }
         try {
           controller.enqueue(encoder.encode(`data: ${JSON.stringify(value)}\n\n`));
         } catch {
@@ -2200,11 +2222,21 @@ function responsesStream(
   const cancellation = createStreamCancellation(state, session, lease, downstreamSignal);
   let closed = false;
   let heartbeat: ReturnType<typeof setInterval> | undefined;
+  let backpressuredAt = 0;
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
       let sequence = 0;
       const send = (event: Record<string, unknown>): void => {
         if (closed) return;
+        const pressure = observeStreamBackpressure(backpressuredAt, controller.desiredSize);
+        backpressuredAt = pressure.blockedSince;
+        if (pressure.expired) {
+          closed = true;
+          if (heartbeat) clearInterval(heartbeat);
+          void metrics?.cancel(200);
+          cancellation.scheduleAbortAndRelease();
+          return;
+        }
         try {
           controller.enqueue(encoder.encode(`event: ${String(event.type)}\ndata: ${JSON.stringify({ ...event, sequence_number: sequence++ })}\n\n`));
         } catch {
