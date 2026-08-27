@@ -15,8 +15,7 @@
   },
   "kv_namespaces": [
     {
-      "binding": "SENSITIVE_KV",
-      "id": "00000000000000000000000000000000"
+      "binding": "SENSITIVE_KV"
     }
   ],
   "durable_objects": {
@@ -31,7 +30,6 @@
   "vars": {
     "ENVIRONMENT": "production",
     "TENANT_NAME": "default",
-    "BOOTSTRAP_ADMIN_PASSWORD": "admin888",
     "MAX_ACCOUNTS": "40",
     "MIGRATION_ENABLED": "false",
     "MIGRATION_CANDIDATE_TAG": "account-migration-candidate",
@@ -41,7 +39,7 @@
     "M365_SCOPE": "openid profile offline_access https://substrate.office.com/sydney/M365Chat.Read https://substrate.office.com/sydney/sydney.readwrite"
   },
   "secrets": {
-    "required": ["DATA_ENCRYPTION_KEY"]
+    "required": ["DATA_ENCRYPTION_KEY", "BOOTSTRAP_ADMIN_PASSWORD"]
   },
   "observability": {
     "enabled": true,

@@ -43,7 +43,7 @@ export interface PublicAccount {
   isolated: boolean;
   status: "online" | "expired" | "cooldown" | "isolated";
   /** Access-token lifecycle. Standby accounts retain refresh tokens but are not decrypted until promoted. */
-  tokenState: "valid" | "refresh_due" | "retry_scheduled" | "standby";
+  tokenState: "valid" | "refresh_due" | "retry_scheduled" | "standby" | "auth_failed" | "isolated";
   /** Next proactive refresh attempt for the active account; null for standby accounts. */
   refreshScheduledAt: string | null;
   health: "healthy" | "cooldown" | "isolated";
@@ -67,6 +67,8 @@ export interface RequestMetricInput {
   status: number;
   /** Protocol-level terminal state, independent of the HTTP status. */
   semanticStatus?: RequestSemanticStatus;
+  /** Privacy-safe gateway error code, never an upstream message. */
+  code?: string;
   /** End-to-end time through the real terminal event, not Response construction. */
   durationMs?: number;
   tokenIn?: number;

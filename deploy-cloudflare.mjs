@@ -83,6 +83,31 @@ function runWrangler(commandArgs, options = {}) {
   return run(process.execPath, [wranglerEntry, ...commandArgs], options);
 }
 
+function randomSecret(bytes = 24) {
+  return randomBytes(bytes).toString("base64url");
+}
+
+function parseWranglerJSON(output) {
+  const firstArray = output.indexOf("[");
+  const lastArray = output.lastIndexOf("]");
+  const firstObject = output.indexOf("{");
+  const lastObject = output.lastIndexOf("}");
+  const candidates = [];
+  if (firstArray >= 0 && lastArray > firstArray) candidates.push(output.slice(firstArray, lastArray + 1));
+  if (firstObject >= 0 && lastObject > firstObject) candidates.push(output.slice(firstObject, lastObject + 1));
+  for (const candidate of candidates) {
+    try { return JSON.parse(candidate); } catch { /* try next bounded JSON value */ }
+  }
+  throw new Error("Wrangler 返回了无法解析的 JSON");
+}
+
+function configuredSecretNames(configPath) {
+  const output = runWrangler(["secret", "list", "--config", configPath, "--format", "json"], { capture: true });
+  const parsed = parseWranglerJSON(output);
+  if (!Array.isArray(parsed)) throw new Error("Wrangler Secret 清单格式无效");
+  return new Set(parsed.flatMap((item) => item && typeof item === "object" && typeof item.name === "string" ? [item.name] : []));
+}
+
 async function ask(question, fallback = "") {
   if (args.yes) return fallback;
   const suffix = fallback ? ` [${fallback}]` : "";
@@ -131,7 +156,7 @@ function configFor({ workerName, clientId, kvId, domain }) {
       html_handling: "none",
       not_found_handling: "none",
     },
-    kv_namespaces: [{ binding: "SENSITIVE_KV", id: kvId }],
+    kv_namespaces: [{ binding: "SENSITIVE_KV", ...(kvId ? { id: kvId } : {}) }],
     durable_objects: {
       bindings: [
         { name: "TENANTS", class_name: "TenantState" },
@@ -142,7 +167,6 @@ function configFor({ workerName, clientId, kvId, domain }) {
     vars: {
       ENVIRONMENT: "production",
       TENANT_NAME: "default",
-      BOOTSTRAP_ADMIN_PASSWORD: "admin888",
       MAX_ACCOUNTS: "40",
       MIGRATION_ENABLED: "false",
       MIGRATION_CANDIDATE_TAG: "account-migration-candidate",
@@ -151,7 +175,7 @@ function configFor({ workerName, clientId, kvId, domain }) {
       M365_REDIRECT_URI: "https://login.microsoftonline.com/common/oauth2/nativeclient",
       M365_SCOPE: "openid profile offline_access https://substrate.office.com/sydney/M365Chat.Read https://substrate.office.com/sydney/sydney.readwrite",
     },
-    secrets: { required: ["DATA_ENCRYPTION_KEY"] },
+    secrets: { required: ["DATA_ENCRYPTION_KEY", "BOOTSTRAP_ADMIN_PASSWORD"] },
     observability: { enabled: true, head_sampling_rate: 1 },
   };
   if (domain) config.routes = [{ pattern: domain, custom_domain: true }];
@@ -200,7 +224,9 @@ async function main() {
   temporaryDirectory = await mkdtemp(path.join(tmpdir(), "m365-gateway-cf-"));
   const configPath = path.join(temporaryDirectory, "wrangler.deploy.json");
   const secretPath = path.join(temporaryDirectory, "secrets.json");
-  let kvId = args.kv_id ?? "00000000000000000000000000000000";
+  let kvId = args.kv_id ?? "";
+  let bootstrapPassword = "";
+  let secretsForDeploy = {};
 
   if (args.update) {
     if (!kvId || /^0{32}$/u.test(kvId)) kvId = await ask("粘贴现有 SENSITIVE_KV namespace ID", "");
@@ -224,25 +250,46 @@ async function main() {
     console.log("KV 已创建并仅写入临时部署配置。");
 
     console.log("\n[4/7] 生成 DATA_ENCRYPTION_KEY…");
-    await writeFile(secretPath, `${JSON.stringify({ DATA_ENCRYPTION_KEY: randomBytes(32).toString("base64url") })}\n`, { mode: 0o600 });
-    console.log("加密密钥已生成；不会显示在终端，也不会写入项目目录。");
+    bootstrapPassword = randomSecret(24);
+    secretsForDeploy = {
+      DATA_ENCRYPTION_KEY: randomBytes(32).toString("base64url"),
+      BOOTSTRAP_ADMIN_PASSWORD: bootstrapPassword,
+    };
+    await writeFile(secretPath, `${JSON.stringify(secretsForDeploy)}\n`, { mode: 0o600 });
+    console.log("加密密钥和随机初始管理员密码已生成；不会写入项目目录。");
   } else {
-    console.log("\n[3/7] 更新模式：复用现有 KV 和现有 DATA_ENCRYPTION_KEY。");
+    console.log("\n[3/7] 更新模式：检查并复用现有 KV 与 Secret。");
+    const secretNames = configuredSecretNames(configPath);
+    if (!secretNames.has("DATA_ENCRYPTION_KEY")) {
+      throw new Error("现有 Worker 缺少 DATA_ENCRYPTION_KEY；为避免破坏已有 OAuth 密文，已停止更新");
+    }
+    if (!secretNames.has("BOOTSTRAP_ADMIN_PASSWORD")) {
+      bootstrapPassword = randomSecret(24);
+      secretsForDeploy = { BOOTSTRAP_ADMIN_PASSWORD: bootstrapPassword };
+      await writeFile(secretPath, `${JSON.stringify(secretsForDeploy)}\n`, { mode: 0o600 });
+      console.log("现有 Worker 缺少新的引导密码 Secret；已生成随机值。已有管理员密码不会被覆盖。");
+    }
   }
 
-  console.log("\n[5/7] 执行 TypeScript、后台契约和部署 dry-run 检查…");
-  runNpm(["run", "check"]);
+  console.log("\n[5/7] 执行 TypeScript、后台契约、Worker 回归测试和部署 dry-run…");
+  runNpm(["run", "check:no-docs"]);
+  runNpm(["run", "typecheck"]);
+  runNpm(["run", "check:ui"]);
+  runNpm(["test"]);
+  runWrangler(["deploy", "--config", configPath, "--dry-run"]);
 
   console.log("\n[6/7] 部署 Cloudflare Worker…");
   const deployArgs = ["deploy", "--config", configPath, "--keep-vars", "--message", "one-click Cloudflare deployment"];
-  if (!args.update) deployArgs.push("--secrets-file", secretPath);
+  if (Object.keys(secretsForDeploy).length > 0) deployArgs.push("--secrets-file", secretPath);
   runWrangler(deployArgs);
 
   console.log("\n[7/7] 部署完成");
   console.log(`Worker：${workerName}`);
   if (domain) console.log(`管理后台：https://${domain}/`);
   else console.log("管理后台地址请使用上方 Wrangler 输出的 workers.dev URL。");
-  console.log("首次登录密码：admin888；登录后必须立即修改，然后添加 Microsoft 365 账号并创建 API Key。");
+  if (bootstrapPassword) console.log(`本次生成的初始管理员密码（仅显示一次）：${bootstrapPassword}`);
+  else console.log("管理员密码沿用现有 Durable Object 状态。");
+  console.log("首次登录后必须立即修改管理员密码，然后添加 Microsoft 365 账号并创建 API Key。");
 }
 
 try {

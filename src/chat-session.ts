@@ -219,7 +219,7 @@ export interface ChatLease {
   portableProtocolTail: string;
 }
 
-export type DurableChatHubRequest = Omit<ChatHubRequest, "signal">;
+export type DurableChatHubRequest = Omit<ChatHubRequest, "signal"> & { runId: string };
 
 export type DurableChatHubOutcome =
   | { ok: true; result: ChatHubResult }
@@ -233,6 +233,9 @@ export type DurableChatHubOutcome =
     };
 
 export class ChatSession extends DurableObject<Env> {
+  private readonly activeChatRuns = new Map<string, AbortController>();
+  private readonly cancelledChatRuns = new Set<string>();
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     ctx.blockConcurrencyWhile(async () => this.initializeStateSchema());
@@ -298,8 +301,20 @@ export class ChatSession extends DurableObject<Env> {
     request: DurableChatHubRequest,
     relay?: ChatHubRelay,
   ): Promise<DurableChatHubOutcome> {
+    const { runId, ...chatRequest } = request;
+    if (!/^[0-9a-f-]{36}$/iu.test(runId)) {
+      return { ok: false, failure: { message: "INVALID_CHAT_RUN_ID", invocationSubmitted: false, terminalEmptyQuota: false } };
+    }
+    if (this.cancelledChatRuns.delete(runId)) {
+      return { ok: false, failure: { message: "REQUEST_ABORTED", invocationSubmitted: false, terminalEmptyQuota: false } };
+    }
+    if (this.activeChatRuns.has(runId)) {
+      return { ok: false, failure: { message: "CHAT_RUN_ALREADY_ACTIVE", invocationSubmitted: false, terminalEmptyQuota: false } };
+    }
+    const controller = new AbortController();
+    this.activeChatRuns.set(runId, controller);
     try {
-      return { ok: true, result: await chatHub(account, request, undefined, relay) };
+      return { ok: true, result: await chatHub(account, { ...chatRequest, signal: controller.signal }, undefined, relay) };
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : "UNKNOWN_CHAT_ERROR";
       return {
@@ -310,7 +325,28 @@ export class ChatSession extends DurableObject<Env> {
           terminalEmptyQuota: isTerminalEmptyQuotaFailure(cause),
         },
       };
+    } finally {
+      this.activeChatRuns.delete(runId);
     }
+  }
+
+  /** Cancel an outbound ChatHub WebSocket without waiting for its hard deadline. */
+  async cancelChatHub(runId: string): Promise<"cancelled" | "queued" | "invalid"> {
+    if (!/^[0-9a-f-]{36}$/iu.test(runId)) return "invalid";
+    const active = this.activeChatRuns.get(runId);
+    if (active) {
+      active.abort();
+      return "cancelled";
+    }
+    // RPCs sent through the same stub are ordered, but retain a small bounded
+    // pre-cancel fence for runtimes that deliver cancellation before startup.
+    this.cancelledChatRuns.add(runId);
+    while (this.cancelledChatRuns.size > 128) {
+      const oldest = this.cancelledChatRuns.values().next().value as string | undefined;
+      if (!oldest) break;
+      this.cancelledChatRuns.delete(oldest);
+    }
+    return "queued";
   }
 
   private responseAliasRegistry(): DurableObjectStub<ChatSession> {

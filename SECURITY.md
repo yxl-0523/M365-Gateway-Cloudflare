@@ -12,9 +12,9 @@
 
 ## 部署基线
 
-- 部署前必须替换 `wrangler.jsonc` 中全零的 KV ID。
-- `DATA_ENCRYPTION_KEY` 只能通过 `wrangler secret put` 注入，不能写入配置或 Git。
-- 初始管理密码 `admin888` 仅用于首次登录；部署后必须立即修改。
+- 仓库不预填 KV ID；手工部署前必须绑定本部署自己创建的 `SENSITIVE_KV`。
+- `DATA_ENCRYPTION_KEY` 只能通过首次部署的临时 `--secrets-file` 或已有 Worker 的 `wrangler secret put` 注入，不能写入配置或 Git。
+- `BOOTSTRAP_ADMIN_PASSWORD` 必须是每次新部署独立生成的随机 Cloudflare Secret，至少 12 个字符；首次登录后必须立即修改。
 - 生产回归脚本应设置 `M365_PRODUCTION_HOST`，默认禁止误打生产域名。
 - 迁移端点默认关闭；临时启用后必须删除迁移签名 Secret 并恢复关闭状态。
 - 定期运行 `npm audit`、`npm run check` 并查看 Cloudflare 部署/Secret 清单。

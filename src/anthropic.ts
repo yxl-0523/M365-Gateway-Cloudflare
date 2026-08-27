@@ -85,8 +85,15 @@ function jsonHeaders(): HeadersInit {
   return { "Cache-Control": "no-store", "Content-Type": "application/json; charset=utf-8" };
 }
 
-export function anthropicErrorResponse(status: number, type: AnthropicErrorType, message: string): Response {
-  return Response.json({ type: "error", error: { type, message } }, { status, headers: jsonHeaders() });
+export function anthropicErrorResponse(
+  status: number,
+  type: AnthropicErrorType,
+  message: string,
+  code: string = type,
+): Response {
+  const headers = new Headers(jsonHeaders());
+  headers.set("X-M365-Error-Code", /^[a-z0-9_]{1,64}$/u.test(code) ? code : "api_error");
+  return Response.json({ type: "error", error: { type, message } }, { status, headers });
 }
 
 function invalid(message: string, status = 400): never {
@@ -319,8 +326,8 @@ function nonStreamingMessage(body: OpenAICompletion, requestedModel: string): Re
       output_tokens: safeInteger(body.usage?.completion_tokens),
     },
     m365: {
-      usage_source: "unavailable_from_chathub",
-      usage_values_are_placeholders: true,
+      usage_source: "gateway_estimate",
+      usage_values_are_estimates: true,
     },
   };
 }
@@ -364,11 +371,12 @@ function errorType(status: number, code: string): AnthropicErrorType {
   return "invalid_request_error";
 }
 
-function mappedError(status: number, body: OpenAIErrorBody): { type: AnthropicErrorType; message: string } {
+function mappedError(status: number, body: OpenAIErrorBody): { type: AnthropicErrorType; message: string; code: string } {
   const code = typeof body.error?.code === "string" ? body.error.code : "upstream_error";
   return {
     type: errorType(status, code),
     message: stableErrorMessages[code] ?? (status >= 500 ? "Microsoft 365 gateway request failed" : "request could not be processed"),
+    code: /^[a-z0-9_]{1,64}$/u.test(code) ? code : "upstream_error",
   };
 }
 
@@ -380,7 +388,7 @@ async function mapErrorResponse(response: Response): Promise<Response> {
     // Never copy an arbitrary upstream body into a public error.
   }
   const failure = mappedError(response.status, parsed);
-  return anthropicErrorResponse(response.status, failure.type, failure.message);
+  return anthropicErrorResponse(response.status, failure.type, failure.message, failure.code);
 }
 
 function sse(event: string, data: unknown): Uint8Array {
@@ -412,6 +420,8 @@ function streamingResponse(
       let currentBlock: "text" | "tool" | "" = "";
       let sawTerminal = false;
       let failed = false;
+      let inputTokens = 0;
+      let outputTokens = 0;
       const send = (event: string, data: Record<string, unknown>): void => {
         if (!cancelled) controller.enqueue(sse(event, { type: event, ...data }));
       };
@@ -459,6 +469,10 @@ function streamingResponse(
           streamFailure(502, { error: { code: parsed.error.code, message: parsed.error.message } });
           return;
         }
+        if (isRecord(parsed.usage)) {
+          inputTokens = safeInteger(parsed.usage.prompt_tokens);
+          outputTokens = safeInteger(parsed.usage.completion_tokens);
+        }
         let choice: OpenAIChoice;
         try {
           choice = firstChoice(parsed.choices);
@@ -485,7 +499,7 @@ function streamingResponse(
         if (typeof choice.finish_reason === "string") {
           closeBlock();
           const reason = choice.finish_reason === "tool_calls" ? "tool_use" : choice.finish_reason === "length" ? "max_tokens" : "end_turn";
-          send("message_delta", { delta: { stop_reason: reason, stop_sequence: null }, usage: { output_tokens: 0 } });
+          send("message_delta", { delta: { stop_reason: reason, stop_sequence: null }, usage: { input_tokens: inputTokens, output_tokens: outputTokens } });
           send("message_stop", {});
           sawTerminal = true;
         } else if (Object.keys(delta).length === 0) {
@@ -569,7 +583,7 @@ export async function anthropicRequest(
   handler: OpenAIRequestHandler = openAIRequest,
   metrics?: RequestMetricTracker,
 ): Promise<Response> {
-  if (request.method !== "POST") return anthropicErrorResponse(405, "invalid_request_error", "POST is required for /v1/messages");
+  if (request.method !== "POST") return anthropicErrorResponse(405, "invalid_request_error", "POST is required for /v1/messages", "method_not_allowed");
   try {
     const parsed = await readBody(request);
     const converted = convertAnthropicBody(parsed);
@@ -591,10 +605,10 @@ export async function anthropicRequest(
       completion = await upstream.json<OpenAICompletion>();
       return Response.json(nonStreamingMessage(completion, converted.model), { headers: jsonHeaders() });
     } catch {
-      return anthropicErrorResponse(502, "api_error", "Microsoft 365 gateway returned an invalid response");
+      return anthropicErrorResponse(502, "api_error", "Microsoft 365 gateway returned an invalid response", "upstream_response_error");
     }
   } catch (cause) {
-    if (cause instanceof AnthropicRequestError) return anthropicErrorResponse(cause.status, cause.errorType, cause.publicMessage);
-    return anthropicErrorResponse(500, "api_error", "Cloudflare-native gateway request failed");
+    if (cause instanceof AnthropicRequestError) return anthropicErrorResponse(cause.status, cause.errorType, cause.publicMessage, "invalid_request_error");
+    return anthropicErrorResponse(500, "api_error", "Cloudflare-native gateway request failed", "internal_error");
   }
 }

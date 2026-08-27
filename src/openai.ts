@@ -150,7 +150,30 @@ async function durableChatHub(
   if (typeof (runner as unknown as { runChatHub?: unknown }).runChatHub !== "function") {
     return chatHub(account, request, undefined, relay);
   }
-  const outcome = await runner.runChatHub(account, durableRequest, relay) as DurableChatHubOutcome;
+  const runId = crypto.randomUUID();
+  const outcomePromise = runner.runChatHub(account, { ...durableRequest, runId }, relay) as Promise<DurableChatHubOutcome>;
+  let onAbort: (() => void) | undefined;
+  const aborted = signal ? new Promise<never>((_resolve, reject) => {
+    onAbort = () => {
+      void (async () => {
+        try {
+          await runner.cancelChatHub(runId);
+          // Do not release the per-account gate until the runner confirms the
+          // outbound WebSocket has observed cancellation and settled.
+          await outcomePromise.catch(() => undefined);
+        } finally {
+          reject(new ChatHubAttemptError(new Error("REQUEST_ABORTED"), true));
+        }
+      })();
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  }) : undefined;
+  let outcome: DurableChatHubOutcome;
+  try {
+    outcome = aborted ? await Promise.race([outcomePromise, aborted]) : await outcomePromise;
+  } finally {
+    if (onAbort) signal?.removeEventListener("abort", onAbort);
+  }
   if (outcome.ok === false) {
     throw new ChatHubAttemptError(
       new Error(outcome.failure.message),
@@ -285,8 +308,11 @@ export function availablePromptTokenBudget(model: string, tools: unknown[] | und
   return available;
 }
 
-function apiError(status: number, code: string, message: string): Response {
-  return Response.json({ error: { type: "cloudflare_native_error", code, message } }, { status, headers: { "Cache-Control": "no-store" } });
+function apiError(status: number, code: string, message: string, headers?: HeadersInit): Response {
+  return Response.json({ error: { type: "cloudflare_native_error", code, message } }, {
+    status,
+    headers: { "Cache-Control": "no-store", "X-M365-Error-Code": code, ...headers },
+  });
 }
 
 class ToolLedgerBlockedError extends Error {
@@ -962,6 +988,7 @@ async function acquireConversationLease(
   deadlineAt: number,
   signal?: AbortSignal,
 ): Promise<ChatLease> {
+  const busyDeadline = Math.min(deadlineAt, Date.now() + 15_000);
   for (;;) {
     if (signal?.aborted) throw new Error("REQUEST_ABORTED");
     try {
@@ -969,7 +996,7 @@ async function acquireConversationLease(
     } catch (cause) {
       const code = cause instanceof Error ? cause.message : String(cause);
       if (code !== "CONVERSATION_BUSY") throw cause;
-      const remaining = deadlineAt - Date.now();
+      const remaining = busyDeadline - Date.now();
       if (remaining <= 0) throw new Error("CONVERSATION_BUSY");
       await abortableDelay(Math.min(250, remaining), signal);
     }
@@ -1742,7 +1769,14 @@ export function createStreamCancellation(
   };
 }
 
-function chatCompletion(model: string, result: ChatHubResult, call: FunctionCall | null): Record<string, unknown> {
+type APIUsage = { input_tokens: number; output_tokens: number; total_tokens: number };
+const EMPTY_USAGE: APIUsage = { input_tokens: 0, output_tokens: 0, total_tokens: 0 };
+
+function chatUsage(usage: APIUsage): { prompt_tokens: number; completion_tokens: number; total_tokens: number } {
+  return { prompt_tokens: usage.input_tokens, completion_tokens: usage.output_tokens, total_tokens: usage.total_tokens };
+}
+
+function chatCompletion(model: string, result: ChatHubResult, call: FunctionCall | null, usage: APIUsage = EMPTY_USAGE): Record<string, unknown> {
   const created = Math.floor(Date.now() / 1000);
   const message = call
     ? { role: "assistant", content: null, tool_calls: [{ id: `call_${crypto.randomUUID().replaceAll("-", "")}`, type: "function", function: call }] }
@@ -1753,11 +1787,11 @@ function chatCompletion(model: string, result: ChatHubResult, call: FunctionCall
     created,
     model,
     choices: [{ index: 0, message, finish_reason: call ? "tool_calls" : "stop" }],
-    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    usage: { prompt_tokens: usage.input_tokens, completion_tokens: usage.output_tokens, total_tokens: usage.total_tokens },
   };
 }
 
-function localChatTerminal(model: string, text: string, stream: boolean): Response {
+function localChatTerminal(model: string, text: string, stream: boolean, usage: APIUsage = EMPTY_USAGE): Response {
   const id = `chatcmpl_${crypto.randomUUID().replaceAll("-", "")}`;
   const created = Math.floor(Date.now() / 1000);
   if (!stream) {
@@ -1767,13 +1801,13 @@ function localChatTerminal(model: string, text: string, stream: boolean): Respon
       created,
       model,
       choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }],
-      usage: { prompt_tokens: 0, completion_tokens: estimatePromptTokens(text), total_tokens: estimatePromptTokens(text) },
+      usage: { prompt_tokens: usage.input_tokens, completion_tokens: usage.output_tokens, total_tokens: usage.total_tokens },
     }, { headers: { "Cache-Control": "no-store" } });
   }
   const events = [
     { id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] },
     { id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { content: text }, finish_reason: null }] },
-    { id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+    { id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: usage.input_tokens, completion_tokens: usage.output_tokens, total_tokens: usage.total_tokens } },
   ];
   return new Response(`${events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("")}data: [DONE]\n\n`, { headers: streamHeaders() });
 }
@@ -1843,7 +1877,7 @@ function chatStream(
             await session.release(lease.leaseId);
             metrics?.observeOutputText(turn.text);
             send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { content: turn.text }, finish_reason: null }] });
-            send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
+            send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: chatUsage(metrics?.usage() ?? EMPTY_USAGE) });
             return;
           }
           const { call, result } = turn;
@@ -1863,11 +1897,15 @@ function chatStream(
           } else if (!downstreamText) {
             send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { content: visibleText }, finish_reason: null }] });
           }
-          send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: {}, finish_reason: call ? "tool_calls" : "stop" }] });
+          send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: {}, finish_reason: call ? "tool_calls" : "stop" }], usage: chatUsage(metrics?.usage() ?? EMPTY_USAGE) });
         } catch (cause) {
           await abandonUnseenTurn(session, lease.leaseId);
-          void (downstreamSignal?.aborted || cancellation.signal.aborted ? metrics?.cancel(200) : metrics?.error(200));
           const failure = publicFailure(cause);
+          if (downstreamSignal?.aborted || cancellation.signal.aborted) void metrics?.cancel(200);
+          else {
+            metrics?.setFailureCode(failure.code);
+            void metrics?.error(200);
+          }
           send({ error: { type: cause instanceof ToolLedgerBlockedError ? "invalid_request_error" : "upstream_error", ...failure } });
         } finally {
           if (heartbeat) clearInterval(heartbeat);
@@ -1964,7 +2002,7 @@ async function chatCompletions(request: Request, env: Env, metrics?: RequestMetr
     if (turn.kind === "terminal") {
       await session.release(lease.leaseId);
       metrics?.observeOutputText(turn.text);
-      return localChatTerminal(model, turn.text, false);
+      return localChatTerminal(model, turn.text, false, metrics?.usage());
     }
     const { call, result } = turn;
     if (request.signal.aborted) throw new Error("REQUEST_ABORTED");
@@ -1974,7 +2012,7 @@ async function chatCompletions(request: Request, env: Env, metrics?: RequestMetr
       portableAssistantResult(result, call),
     );
     await completeFinalTurn(session, lease, result, finalTail);
-    return Response.json(chatCompletion(model, result, call), { headers: { "Cache-Control": "no-store" } });
+    return Response.json(chatCompletion(model, result, call, metrics?.usage()), { headers: { "Cache-Control": "no-store" } });
   } catch (cause) {
     await abandonUnseenTurn(session, lease.leaseId);
     throw cause;
@@ -1986,7 +2024,7 @@ function responseOutput(responseId: string, result: ChatHubResult, call: Functio
   return [{ id: `msg_${crypto.randomUUID().replaceAll("-", "")}`, type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: assistantVisibleText(result), annotations: [] }] }];
 }
 
-function responseObject(responseId: string, model: string, output: unknown[], status = "completed"): Record<string, unknown> {
+function responseObject(responseId: string, model: string, output: unknown[], status = "completed", usage: APIUsage = EMPTY_USAGE): Record<string, unknown> {
   return {
     id: responseId,
     object: "response",
@@ -1997,11 +2035,11 @@ function responseObject(responseId: string, model: string, output: unknown[], st
     parallel_tool_calls: false,
     error: null,
     incomplete_details: null,
-    usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+    usage,
   };
 }
 
-function localResponsesTerminal(responseId: string, model: string, text: string, stream: boolean): Response {
+function localResponsesTerminal(responseId: string, model: string, text: string, stream: boolean, usage: APIUsage = EMPTY_USAGE): Response {
   const item = {
     id: `msg_${crypto.randomUUID().replaceAll("-", "")}`,
     type: "message",
@@ -2010,7 +2048,7 @@ function localResponsesTerminal(responseId: string, model: string, text: string,
     content: [{ type: "output_text", text, annotations: [] }],
   };
   const output = [item];
-  if (!stream) return Response.json(responseObject(responseId, model, output), { headers: { "Cache-Control": "no-store" } });
+  if (!stream) return Response.json(responseObject(responseId, model, output, "completed", usage), { headers: { "Cache-Control": "no-store" } });
   let sequence = 0;
   const event = (value: Record<string, unknown>): string => `event: ${String(value.type)}\ndata: ${JSON.stringify({ ...value, sequence_number: sequence++ })}\n\n`;
   const body = [
@@ -2022,7 +2060,7 @@ function localResponsesTerminal(responseId: string, model: string, text: string,
     event({ type: "response.output_text.done", item_id: item.id, output_index: 0, content_index: 0, text }),
     event({ type: "response.content_part.done", item_id: item.id, output_index: 0, content_index: 0, part: item.content[0] }),
     event({ type: "response.output_item.done", output_index: 0, item }),
-    event({ type: "response.completed", response: responseObject(responseId, model, output) }),
+    event({ type: "response.completed", response: responseObject(responseId, model, output, "completed", usage) }),
     "data: [DONE]\n\n",
   ].join("");
   return new Response(body, { headers: streamHeaders() });
@@ -2205,7 +2243,7 @@ function responsesStream(
             send({ type: "response.output_text.done", item_id: messageId, output_index: 0, content_index: 0, text: turn.text });
             send({ type: "response.content_part.done", item_id: messageId, output_index: 0, content_index: 0, part: item.content[0] });
             send({ type: "response.output_item.done", output_index: 0, item });
-            send({ type: "response.completed", response: responseObject(responseId, model, output) });
+            send({ type: "response.completed", response: responseObject(responseId, model, output, "completed", metrics?.usage()) });
             return;
           }
           const { call, result } = turn;
@@ -2245,11 +2283,15 @@ function responsesStream(
           }
           if (call) send(functionEvents.at(-1)!);
           else send({ type: "response.output_item.done", output_index: 0, item });
-          send({ type: "response.completed", response: responseObject(responseId, model, output) });
+          send({ type: "response.completed", response: responseObject(responseId, model, output, "completed", metrics?.usage()) });
         } catch (cause) {
           await abandonUnseenTurn(session, lease.leaseId);
-          void (downstreamSignal?.aborted || cancellation.signal.aborted ? metrics?.cancel(200) : metrics?.error(200));
           const failure = publicFailure(cause);
+          if (downstreamSignal?.aborted || cancellation.signal.aborted) void metrics?.cancel(200);
+          else {
+            metrics?.setFailureCode(failure.code);
+            void metrics?.error(200);
+          }
           send({ type: "response.failed", response: { ...responseObject(responseId, model, [], "failed"), error: failure } });
           send({ type: "error", code: failure.code, message: failure.message });
         } finally {
@@ -2386,7 +2428,7 @@ async function responsesCore(request: Request, env: Env, metrics?: RequestMetric
     if (turn.kind === "terminal") {
       await session.release(lease.leaseId);
       metrics?.observeOutputText(turn.text);
-      return localResponsesTerminal(responseId, model, turn.text, false);
+      return localResponsesTerminal(responseId, model, turn.text, false, metrics?.usage());
     }
     const { call, result } = turn;
     const output = responseOutput(responseId, result, call);
@@ -2403,7 +2445,7 @@ async function responsesCore(request: Request, env: Env, metrics?: RequestMetric
       lease.taskAnchors,
       finalTail,
     );
-    return Response.json(responseObject(responseId, model, output), { headers: { "Cache-Control": "no-store" } });
+    return Response.json(responseObject(responseId, model, output, "completed", metrics?.usage()), { headers: { "Cache-Control": "no-store" } });
   } catch (cause) {
     await abandonUnseenTurn(session, lease.leaseId);
     throw cause;
@@ -2590,6 +2632,9 @@ export async function openAIRequest(
     if (url.pathname === "/v1/chat/completions" && request.method === "POST") return await chatCompletions(request, env, metrics);
     if (url.pathname === "/v1/responses" && request.method === "POST") return await responses(request, env, metrics);
     if (url.pathname === "/v1/images/generations" && request.method === "POST") return await imageGenerations(request, env, metrics);
+    if (["/v1/chat/completions", "/v1/responses", "/v1/images/generations"].includes(url.pathname)) {
+      return apiError(405, "method_not_allowed", `POST is required for ${url.pathname}`);
+    }
     return apiError(404, "not_found", "OpenAI-compatible endpoint not found");
   } catch (cause) {
     if (cause instanceof ToolLedgerBlockedError) {
@@ -2626,7 +2671,7 @@ export async function openAIRequest(
     if (code === "NO_HEALTHY_ACCOUNT" || code === "SESSION_ACCOUNT_COOLDOWN") return apiError(429, "account_cooldown", "all eligible Microsoft 365 accounts are cooling down; retry later");
     if (code === "NO_USABLE_ACCOUNT") return apiError(503, "account_pool_isolated", "all Microsoft 365 accounts require administrator attention");
     if (code === "SESSION_ACCOUNT_ISOLATED" || code === "SESSION_ACCOUNT_MISSING") return apiError(503, "session_account_unavailable", "the account bound to this conversation is unavailable");
-    if (code === "CONVERSATION_BUSY") return apiError(409, "conversation_busy", "this conversation already has an active request");
+    if (code === "CONVERSATION_BUSY") return apiError(409, "conversation_busy", "this conversation already has an active request", { "Retry-After": "1" });
     if (code === "ACCOUNT_QUEUE_TIMEOUT") return apiError(429, "account_busy", "the Microsoft 365 account is busy; retry later");
     if (code === "CHAT_THROTTLED_QUOTA_EXHAUSTED") return apiError(429, "upstream_throttled", "the selected Microsoft 365 account has exhausted its current allowance");
     if (code === "UNSUPPORTED_MODEL") return apiError(400, "unsupported_model", "the requested model is not supported by this gateway");

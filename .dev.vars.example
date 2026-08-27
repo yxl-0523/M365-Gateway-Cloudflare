@@ -1,2 +1,4 @@
 # 32 random bytes encoded as base64url. Never commit the real value.
 DATA_ENCRYPTION_KEY="replace-with-32-byte-base64url-key"
+# Local development only. Use a unique value with at least 12 characters.
+BOOTSTRAP_ADMIN_PASSWORD="replace-with-a-unique-local-bootstrap-password"

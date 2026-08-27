@@ -55,7 +55,7 @@ function json(value: unknown, status = 200, headers?: HeadersInit): Response {
 }
 
 function error(status: number, code: string, message: string): Response {
-  return json({ error: { type: "cloudflare_native_error", code, message } }, status);
+  return json({ error: { type: "cloudflare_native_error", code, message } }, status, { "X-M365-Error-Code": code });
 }
 
 function isJSONObject(value: unknown): value is Record<string, unknown> {
@@ -134,7 +134,7 @@ async function adminRoute(request: Request, env: Env, url: URL): Promise<Respons
     return json({ status: "logged_out" }, 200, { "Set-Cookie": sessionCookie("", 0) });
   }
   if (url.pathname === "/api/admin/change-password" && request.method === "POST") {
-    // The public bootstrap password is only a login credential. Even during
+    // The one-time bootstrap password is only a login credential. Even during
     // first-run replacement, a caller must first prove it completed login and
     // received the HttpOnly administrator session cookie.
     const passwordAccess = await admin(request, env, true);
@@ -145,7 +145,7 @@ async function adminRoute(request: Request, env: Env, url: URL): Promise<Respons
       return json({ status: "password_changed" }, 200, { "Set-Cookie": sessionCookie("", 0) });
     } catch (cause) {
       const code = cause instanceof Error ? cause.message : "PASSWORD_CHANGE_FAILED";
-      if (code === "PASSWORD_TOO_SHORT") return error(400, "password_too_short", "新密码至少需要 8 个字符");
+      if (code === "PASSWORD_TOO_SHORT") return error(400, "password_too_short", "新密码至少需要 12 个字符");
       if (code === "INVALID_ADMIN_PASSWORD") return error(401, "invalid_admin_password", "当前密码错误");
       if (code === "ADMIN_SESSION_REQUIRED") return error(401, "admin_session_required", "请先登录管理员账号");
       throw cause;
@@ -222,7 +222,9 @@ async function adminRoute(request: Request, env: Env, url: URL): Promise<Respons
       maxAccounts: Number(env.MAX_ACCOUNTS),
       environment: env.ENVIRONMENT,
       credentialStorage: CREDENTIAL_STORAGE_DESCRIPTION,
-      sessionTTL: "30 days",
+      sessionTTL: "24 hours",
+      adminSessionTTL: "24 hours",
+      chatSessionTTL: "30 days",
       capabilities: CAPABILITY_MATRIX,
     } });
     return error(501, "not_implemented", "runtime settings editing is not available in the preview build");
@@ -272,6 +274,15 @@ async function accountRoute(request: Request, env: Env, url: URL): Promise<Respo
     } catch (cause) {
       if (cause instanceof Error && cause.message === "ACCOUNT_NOT_ACTIVE") {
         return error(409, "account_not_active", "only the active account can be refreshed");
+      }
+      const code = cause instanceof Error ? cause.message : "TOKEN_REFRESH_FAILED";
+      if (["MICROSOFT_REFRESH_TOKEN_MISSING", "MICROSOFT_REFRESH_TOKEN_REJECTED", "MICROSOFT_TOKEN_EXCHANGE_FAILED"].includes(code)) {
+        return error(409, "token_refresh_authorization_failed", "Microsoft authorization must be renewed for this account");
+      }
+      if (code === "MICROSOFT_TOKEN_RATE_LIMITED") return error(429, "token_refresh_rate_limited", "Microsoft temporarily rate-limited token refresh");
+      if (code === "MICROSOFT_TOKEN_SERVICE_UNAVAILABLE") return error(503, "token_refresh_unavailable", "Microsoft token service is temporarily unavailable");
+      if (["ACCOUNT_CREDENTIAL_MISSING", "ACCOUNT_CREDENTIAL_CORRUPT", "ACCOUNT_CREDENTIAL_MIRROR_UNAVAILABLE"].includes(code)) {
+        return error(500, "account_credential_error", "the encrypted account credential is unavailable");
       }
       return error(502, "token_refresh_failed", "Microsoft token refresh failed");
     }
@@ -363,6 +374,7 @@ async function openAI(
     if (url.searchParams.has("client_version")) return json(codexModelCatalog());
     return json({ object: "list", data: modelCatalog() });
   }
+  if (url.pathname === "/v1/models") return error(405, "method_not_allowed", "GET is required for /v1/models");
   if (url.pathname === "/v1/messages") return anthropicRequest(request, env, openAIRequest, metrics);
   return openAIRequest(request, env, url, metrics);
 }
@@ -396,6 +408,7 @@ export default {
             path: url.pathname,
             status: input.status,
             semantic_status: input.semanticStatus,
+            error_code: input.code ?? "",
             duration_ms: input.durationMs ?? 0,
           }));
           await Promise.all([
@@ -408,7 +421,7 @@ export default {
               path: url.pathname,
               status: input.status,
               durationMs: input.durationMs ?? 0,
-              code: `terminal_${input.semanticStatus ?? (input.status >= 400 ? "error" : "complete")}`,
+              code: `terminal_${input.semanticStatus ?? (input.status >= 400 ? "error" : "complete")}${input.code ? `_${input.code}` : ""}`,
             }),
           ]);
         },
@@ -422,6 +435,7 @@ export default {
       let identified = new Response(response.body, { status: response.status, statusText: response.statusText, headers });
       if (!metrics) console.log(JSON.stringify({ event: "request", request_id: requestId, method: request.method, path: url.pathname, status: response.status }));
       if (metrics) {
+        metrics.setFailureCode(identified.headers.get("X-M365-Error-Code"));
         identified = identified.headers.get("Content-Type")?.toLowerCase().startsWith("text/event-stream")
           ? trackStreamingResponse(identified, metrics)
           : trackBufferedResponse(identified, metrics);
@@ -435,6 +449,7 @@ export default {
           path: url.pathname,
           status: response.status,
           durationMs: Date.now() - startedAt,
+          code: response.headers.get("X-M365-Error-Code") ?? "",
         }).catch(() => {
           // A diagnostic write must never fail the user request. Keep this
           // fallback constant so storage exceptions cannot disclose secrets.
@@ -445,12 +460,14 @@ export default {
     };
     try {
       let response: Response;
-      if (url.pathname === "/api/health") response = json({
-        status: "ok",
-        platform: "cloudflare-native",
-        metadataStorage: "durable-object-sqlite",
-        credentialStorage: CREDENTIAL_STORAGE_DESCRIPTION,
-      });
+      if (url.pathname === "/api/health") response = request.method === "GET"
+        ? json({
+            status: "ok",
+            platform: "cloudflare-native",
+            metadataStorage: "durable-object-sqlite",
+            credentialStorage: CREDENTIAL_STORAGE_DESCRIPTION,
+          })
+        : error(405, "method_not_allowed", "GET is required for /api/health");
       else if (url.pathname === ACCOUNT_MIGRATION_PATH) response = await migrationRoute(request, env);
       else if (url.pathname.startsWith("/api/admin/")) response = await adminRoute(request, env, url);
       else if (url.pathname.startsWith("/api/accounts")) response = await accountRoute(request, env, url);

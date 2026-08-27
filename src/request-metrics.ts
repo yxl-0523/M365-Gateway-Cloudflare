@@ -107,6 +107,7 @@ export class RequestMetricTracker {
   private accountId: string;
   private terminalPromise: Promise<void> | undefined;
   private terminalValue: RequestSemanticStatus | undefined;
+  private failureCode = "";
 
   constructor(options: RequestMetricTrackerOptions) {
     this.requestId = options.requestId;
@@ -133,6 +134,18 @@ export class RequestMetricTracker {
 
   observeOutputText(value: string): void {
     if (!this.terminalPromise) this.outputEstimate.add(value);
+  }
+
+  setFailureCode(value: string | null | undefined): void {
+    if (this.terminalPromise || typeof value !== "string") return;
+    const normalized = value.trim().toLowerCase();
+    this.failureCode = /^[a-z][a-z0-9_]{0,63}$/u.test(normalized) ? normalized : "upstream_error";
+  }
+
+  usage(): { input_tokens: number; output_tokens: number; total_tokens: number } {
+    const input = this.inputEstimate.value();
+    const output = this.outputEstimate.value();
+    return { input_tokens: input, output_tokens: output, total_tokens: input + output };
   }
 
   get semanticStatus(): RequestSemanticStatus | undefined {
@@ -167,6 +180,7 @@ export class RequestMetricTracker {
       accountId: this.accountId || null,
       status: boundedInteger(terminal.httpStatus, 999),
       semanticStatus: terminal.semanticStatus,
+      ...(this.failureCode ? { code: this.failureCode } : {}),
       durationMs: Math.max(0, endedAt - this.startedAt),
       tokenIn: this.inputEstimate.value(),
       tokenOut: this.outputEstimate.value(),

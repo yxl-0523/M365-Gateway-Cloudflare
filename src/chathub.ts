@@ -744,6 +744,17 @@ export function appendChatSnapshot(current: string, snapshot: string, emit?: (de
   return current;
 }
 
+/** Only real user-visible or protocol progress may extend the idle deadline. */
+export function chatHubUpdateHasSemanticProgress(update: Record<string, unknown>): boolean {
+  if (Object.hasOwn(update, "throttling")) return true;
+  if (typeof update.writeAtCursor === "string" && update.writeAtCursor.length > 0) return true;
+  const messages = Array.isArray(update.messages) ? update.messages as Array<Record<string, unknown>> : [];
+  return messages.some((message) =>
+    message.messageType === "Progress"
+    || ["SearchResults", "Code", "ToolCall"].includes(String(message.contentType ?? ""))
+    || (message.author === "bot" && typeof message.text === "string" && message.text.length > 0));
+}
+
 async function runChatHub(
   account: OAuthTokenSet,
   request: ChatHubRequest,
@@ -821,7 +832,9 @@ async function runChatHub(
           invalidJSONFrames += 1;
           continue;
         }
+        const priorImageCount = images.length;
         images = appendUpstreamImageURLs(images, event);
+        if (images.length > priorImageCount) semanticProgress = true;
         const parsedFunctionCall = parseNativeFunctionCall(event, request.tools);
         if (!functionCall && parsedFunctionCall) semanticProgress = true;
         functionCall ||= parsedFunctionCall;
@@ -834,19 +847,21 @@ async function runChatHub(
           continue;
         }
         if (type === 1 && event.target === "update") {
-          semanticProgress = true;
           for (const raw of (event.arguments as unknown[] | undefined) ?? []) {
             const update = raw as Record<string, unknown>;
-            if (Object.hasOwn(update, "throttling")) throttling = update.throttling;
+            if (chatHubUpdateHasSemanticProgress(update)) semanticProgress = true;
+            if (Object.hasOwn(update, "throttling")) {
+              throttling = update.throttling;
+            }
             const messages = (update.messages as Array<Record<string, unknown>> | undefined) ?? [];
             const toolFrame = messages.some((message) => message.messageType === "Progress" || ["SearchResults", "Code", "ToolCall"].includes(String(message.contentType ?? "")));
-            if (!toolFrame && typeof update.writeAtCursor === "string") {
+            if (!toolFrame && typeof update.writeAtCursor === "string" && update.writeAtCursor.length > 0) {
               streamed += update.writeAtCursor;
               if (streamed.length > MAX_OUTPUT_CHARACTERS) throw new Error("CHAT_OUTPUT_TOO_LARGE");
               emit?.(update.writeAtCursor);
             }
             for (const message of messages) {
-              if (message.author === "bot" && typeof message.text === "string") {
+              if (message.author === "bot" && typeof message.text === "string" && message.text.length > 0) {
                 if (message.text.length > MAX_OUTPUT_CHARACTERS) throw new Error("CHAT_OUTPUT_TOO_LARGE");
                 streamed = appendChatSnapshot(streamed, message.text, emit);
               }

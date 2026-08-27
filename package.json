@@ -1,12 +1,11 @@
 {
   "name": "m365-gateway-cloudflare-native",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Cloudflare-native Microsoft 365 gateway with OpenAI and Anthropic compatible APIs",
-  "license": "MIT",
   "private": true,
   "type": "module",
   "scripts": {
-    "check": "npm run check:no-docs && npm run types && npm run typecheck && npm run check:ui && npm run deploy:dry",
+    "check": "npm run check:no-docs && npm run types && npm run typecheck && npm run check:ui && npm test && npm run deploy:dry",
     "check:no-docs": "node scripts/check-no-docs.mjs",
     "check:ui": "node scripts/check-admin-ui.mjs",
     "deploy": "wrangler deploy",
@@ -15,7 +14,8 @@
     "deploy:temporary": "wrangler deploy --temporary",
     "dev": "wrangler dev",
     "typecheck": "tsc --noEmit",
-    "types": "wrangler types src/worker-configuration.d.ts"
+    "types": "wrangler types src/worker-configuration.d.ts",
+    "test": "vitest run"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "latest",

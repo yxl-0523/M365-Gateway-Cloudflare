@@ -688,7 +688,9 @@ export class TenantState extends DurableObject<Env> {
 
   private async ensureAdmin(): Promise<void> {
     if (this.meta("admin_password")) return;
-    this.setMeta("admin_password", await passwordRecord(this.env.BOOTSTRAP_ADMIN_PASSWORD || "admin888"));
+    const bootstrapPassword = this.env.BOOTSTRAP_ADMIN_PASSWORD?.trim() ?? "";
+    if (bootstrapPassword.length < 12) throw new Error("BOOTSTRAP_ADMIN_PASSWORD_REQUIRED");
+    this.setMeta("admin_password", await passwordRecord(bootstrapPassword));
     this.setMeta("must_change_password", "true");
   }
 
@@ -1046,7 +1048,10 @@ export class TenantState extends DurableObject<Env> {
 
   async recordDiagnostic(input: DiagnosticInput): Promise<void> {
     const status = boundedInteger(input.status, 999);
-    const level = status >= 500 ? "error" : status >= 400 ? "warn" : "info";
+    const diagnosticCode = safeDiagnosticIdentifier(input.code ?? "", 64, "");
+    const level = status >= 500 || diagnosticCode.startsWith("terminal_error")
+      ? "error"
+      : status >= 400 || diagnosticCode.startsWith("terminal_cancel") ? "warn" : "info";
     this.ctx.storage.transactionSync(() => {
       this.ctx.storage.sql.exec(
         `INSERT INTO diagnostic_events(request_id,at,level,method,path,status,duration_ms,code)
@@ -1058,7 +1063,7 @@ export class TenantState extends DurableObject<Env> {
         safeDiagnosticPath(input.path),
         status,
         boundedInteger(input.durationMs, MAX_DIAGNOSTIC_DURATION_MS),
-        safeDiagnosticIdentifier(input.code ?? "", 64, ""),
+        diagnosticCode,
       );
       this.ctx.storage.sql.exec(
         `DELETE FROM diagnostic_events WHERE sequence NOT IN
@@ -1149,7 +1154,7 @@ export class TenantState extends DurableObject<Env> {
     // live HttpOnly session issued by `login()`.
     const session = await this.session(rawToken);
     if (!session.authenticated) throw new Error("ADMIN_SESSION_REQUIRED");
-    if (newPassword.length < 8) throw new Error("PASSWORD_TOO_SHORT");
+    if (newPassword.length < 12) throw new Error("PASSWORD_TOO_SHORT");
     if (!(await verifyPassword(this.meta("admin_password") ?? "", currentPassword))) throw new Error("INVALID_ADMIN_PASSWORD");
     this.setMeta("admin_password", await passwordRecord(newPassword));
     this.setMeta("must_change_password", "false");
@@ -1656,7 +1661,9 @@ export class TenantState extends DurableObject<Env> {
       ? row.failure_kind as PublicAccount["failureKind"]
       : "";
     const refresh = active ? this.activeTokenRefreshSchedule(now) : null;
-    const tokenState: PublicAccount["tokenState"] = !active
+    const tokenState: PublicAccount["tokenState"] = health === "isolated"
+      ? failureKind === "auth" ? "auth_failed" : "isolated"
+      : !active
       ? "standby"
       : refresh?.retryScheduled
         ? "retry_scheduled"

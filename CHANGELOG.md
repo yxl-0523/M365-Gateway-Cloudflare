@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.1 - 2026-08-27
+
+- 全量稳定性修复：客户端断开会跨 Durable Object 取消上游 WebSocket，账号门控只在上游真正结束后释放，避免遗留活动请求造成连续 409。
+- ChatHub 空更新不再续期进展超时；保留 90 秒无语义进展超时和 10 分钟逻辑硬上限。
+- 统一 OpenAI、Responses、Anthropic 的终端错误码、SSE 失败统计和估算 Token 用量，诊断记录可按脱敏错误码定位。
+- Microsoft 刷新令牌错误按授权失效、限流、服务不可用和凭据损坏分别映射 HTTP 状态，后台明确显示“需要重新授权”。
+- 删除共享默认管理员密码；新部署必须提供随机 `BOOTSTRAP_ADMIN_PASSWORD` Secret，一键部署只显示一次随机初始密码。
+- KV 绑定不再包含可误用的全零 ID；一键部署自动创建独立 KV，更新模式强制复用原 KV 和加密 Secret。
+- 增加当前 Cloudflare Vitest Workers 测试池回归，覆盖 HTTP 方法、初始改密、API Key、Durable Object 取消、进展超时、工具续接和幂等统计。
+
 ## 0.1.0 - 2026-08-26
 
 - 增加 `deploy-cloudflare.mjs` JavaScript 一键部署器，自动创建 KV、生成加密 Secret、检查并部署 Worker；更新模式强制复用原 KV 与 Secret。

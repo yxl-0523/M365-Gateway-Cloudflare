@@ -1,7 +1,6 @@
 # M365 Gateway Cloudflare 原生开源版（CF 版）
 
-版本：`0.1.0`  
-许可证：MIT  
+版本：`0.1.1`  
 部署形态：Cloudflare Workers + Static Assets + Durable Objects + KV
 
 这是完全运行在 Cloudflare 上的独立部署形态。Worker 直接连接 Microsoft 365 ChatHub，不依赖 VPS、Nginx、Docker、Cloudflare Tunnel 或任何本机/服务器源站，也不使用代理。
@@ -22,7 +21,7 @@
 - `scripts/`：管理后台契约检查、候选环境功能回归和 soak 测试。
 
 - `optional-egress-relay/`：可选的固定目标出口 Relay；直接使用 Cloudflare 出口时不需要部署。
-- `wrangler.jsonc`：可公开提交的部署模板；其中全零 KV ID 必须替换。
+- `wrangler.jsonc`：可公开提交的部署模板；为防止误连他人的存储，仓库不预填生产 KV ID。
 
 ## 架构与数据边界
 
@@ -114,7 +113,7 @@ Remove-Item Env:M365_TEST_API_KEY,Env:M365_TEST_MODELS,Env:M365_TEST_SCOPE -Erro
 
 ### JavaScript 一键部署（推荐新用户）
 
-项目根目录提供 `deploy-cloudflare.mjs`，仅依赖 Node.js 内置模块。它会自动安装锁定依赖、打开 Cloudflare 官方登录、创建独立 KV、生成不回显的 32 字节加密 Secret、运行完整检查、生成临时部署配置并发布 Worker。临时配置和 Secret 位于系统临时目录，无论成功失败都会删除，不会写入 Git。
+项目根目录提供 `deploy-cloudflare.mjs`。它会自动安装锁定依赖、打开 Cloudflare 官方登录、创建独立 KV，生成 32 字节加密 Secret 和随机初始管理员密码，运行完整检查、生成临时部署配置并发布 Worker。临时配置和 Secret 位于系统临时目录，无论成功失败都会删除，不会写入 Git；随机初始管理员密码只在部署成功后的终端显示一次。
 
 进入项目目录后只需运行：
 
@@ -146,7 +145,7 @@ node .\deploy-cloudflare.mjs --update --name my-m365-gateway --client-id "原-En
 node .\deploy-cloudflare.mjs --dry-run --yes --name m365-gateway-check --client-id "00000000-0000-4000-8000-000000000001"
 ```
 
-安全限制：已有部署不得改用新 KV，也不得重新生成 `DATA_ENCRYPTION_KEY`，否则已有 OAuth 密文将无法读取。一键脚本不会自动完成 Microsoft OAuth；部署结束后仍需进入管理后台修改初始密码、添加账号并创建客户端 API Key。
+安全限制：已有部署不得改用新 KV，也不得重新生成 `DATA_ENCRYPTION_KEY`，否则已有 OAuth 密文将无法读取。一键脚本不会自动完成 Microsoft OAuth；部署结束后仍需保存终端显示的一次性随机初始密码，进入管理后台修改密码、添加账号并创建客户端 API Key。
 
 ### 第 0 步：准备环境
 
@@ -212,8 +211,8 @@ KV 是 OAuth 密文的异地镜像；生产、预发布、本地预览必须使�
 npx wrangler kv namespace create SENSITIVE_KV
 ```
 
-复制输出中的生产 `id`，替换 `wrangler.jsonc` 内 `kv_namespaces[0].id` 的全零占位符
-`00000000000000000000000000000000`。只改 `id`，保留 `binding: "SENSITIVE_KV"`。不要把 preview ID 当成生产 ID，也不要复用其他项目的 KV。
+复制输出中的生产 `id`，在 `wrangler.jsonc` 的 `kv_namespaces[0]` 中增加
+`"id": "你自己的32位KV命名空间ID"`。保留 `binding: "SENSITIVE_KV"`。不要把 preview ID 当成生产 ID，也不要复用其他项目的 KV。
 
 ### 第 5 步：检查公开变量并设置加密 Secret
 
@@ -222,20 +221,29 @@ npx wrangler kv namespace create SENSITIVE_KV
 - `name` 是当前 Cloudflare 账号内唯一、便于识别的 Worker 名称。
 - `M365_CLIENT_ID` 是刚才创建的 Entra 应用 ID。
 - `M365_REDIRECT_URI` 与 Entra Authentication 中的 URI 完全一致。
-- `kv_namespaces[0].id` 已不再是全零占位符。
+- `kv_namespaces[0].id` 已填写为本部署刚创建的 KV ID。
 - 没有把 API Key、OAuth token、管理员密码或 `DATA_ENCRYPTION_KEY` 写进文件。
 
-生产 `DATA_ENCRYPTION_KEY` 必须是独立的 32 字节 base64url 随机值。下面的 PowerShell 只通过管道交给 Wrangler，不会写入项目文件：
+生产 `DATA_ENCRYPTION_KEY` 必须是独立的 32 字节 base64url 随机值。首次部署时 Worker 尚不存在，不能依赖先运行 `wrangler secret put`；应把两个 Secret 写进系统临时文件，再让第一次 `wrangler deploy --secrets-file` 原子创建版本：
 
 ```powershell
 $bytes = New-Object byte[] 32
 [Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
 $productionKey = [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+','-').Replace('/','_')
-$productionKey | npx wrangler secret put DATA_ENCRYPTION_KEY
-Remove-Variable productionKey,bytes
+$adminBytes = New-Object byte[] 24
+[Security.Cryptography.RandomNumberGenerator]::Fill($adminBytes)
+$bootstrapPassword = [Convert]::ToBase64String($adminBytes).TrimEnd('=').Replace('+','-').Replace('/','_')
+$secretFile = Join-Path ([IO.Path]::GetTempPath()) ("m365-gateway-secrets-" + [guid]::NewGuid().ToString('N') + ".json")
+@{
+  DATA_ENCRYPTION_KEY = $productionKey
+  BOOTSTRAP_ADMIN_PASSWORD = $bootstrapPassword
+} | ConvertTo-Json | Set-Content -LiteralPath $secretFile -Encoding utf8NoBOM
+Write-Host "请立即保存这次生成的初始管理员密码：$bootstrapPassword"
 ```
 
-把密钥保存到离线密码管理器或企业 Secret Manager。密钥丢失后，Durable Object 和 KV 中的 OAuth 密文无法解密，只能重新授权账号；不要“生成一个新密钥试试”。
+把 `$productionKey` 保存到离线密码管理器或企业 Secret Manager，把 `$bootstrapPassword` 保存到管理员密码库。加密密钥丢失后，Durable Object 和 KV 中的 OAuth 密文无法解密，只能重新授权账号；不要“生成一个新密钥试试”。临时文件必须一直保留到下一步部署命令结束，并在 `finally` 中删除。
+
+只有全新 `TenantState` 会使用这个 Secret 建立管理员密码哈希；以后重新部署或更换该 Secret 都不会覆盖已修改的管理员密码。
 
 ### 第 6 步：选择域名并部署
 
@@ -250,11 +258,19 @@ Remove-Variable productionKey,bytes
 ],
 ```
 
-然后执行检查和部署：
+然后执行检查和首次部署。无论部署成功或失败，`finally` 都会删除包含明文 Secret 的临时文件和当前 PowerShell 变量：
 
 ```powershell
-npm run check
-npx wrangler deploy
+try {
+  npm run check
+  if ($LASTEXITCODE -ne 0) { throw "本地检查失败" }
+  npx wrangler deploy --secrets-file "$secretFile"
+  if ($LASTEXITCODE -ne 0) { throw "Cloudflare 部署失败" }
+}
+finally {
+  if ($secretFile) { Remove-Item -LiteralPath $secretFile -Force -ErrorAction SilentlyContinue }
+  Remove-Variable secretFile,productionKey,bootstrapPassword,bytes,adminBytes -ErrorAction SilentlyContinue
+}
 ```
 
 首次部署会创建 `TenantState`、`ChatSession` Durable Object 绑定并应用 `v1` SQLite migration。终端输出的 Worker URL 和 version ID 请记录下来。不要删除旧 migration，也不要通过删除 Durable Object/KV 来“重置”部署。
@@ -275,8 +291,8 @@ npx wrangler deployments list
 ### 第 8 步：初始化管理后台
 
 1. 浏览器打开 `$origin/`，进入登录页。
-2. 全新 Durable Object 的引导密码是 `admin888`。登录后立即修改为至少 8 个字符的唯一密码；这是公开模板值，不能长期使用。
-3. 重新部署不会覆盖已经修改过的密码；忘记密码时按项目提供的管理员恢复流程处理，不要直接删除生产数据。
+2. 输入一键部署成功后终端只显示一次的随机初始管理员密码。手工部署则输入第 5 步生成并保存的 `BOOTSTRAP_ADMIN_PASSWORD`。
+3. 首次登录会强制修改为至少 12 个字符的新密码。重新部署不会覆盖已经修改过的密码；忘记密码时按项目提供的管理员恢复流程处理，不要直接删除生产数据。
 4. 进入“平台与账号”，点击“添加账号”，完成 Microsoft 登录和授权。
 5. 授权结束后，按页面提示粘贴浏览器最终回调 URL（包含 `code`、`state` 的完整地址）。该 URL 只能在当前授权流程中使用，不能发到群聊、工单或日志。
 6. 等账号状态变为在线后，进入“API 密钥”创建客户端 Key。完整 `m365_...` 只显示一次，关闭页面后无法恢复；丢失时撤销旧 Key 并新建。
@@ -329,19 +345,13 @@ npx wrangler deployments list
    npx wrangler kv namespace create SENSITIVE_KV
    ```
 
-   将返回的命名空间 ID 写入 `wrangler.jsonc` 的 `kv_namespaces[0].id`，替换模板中的 `00000000000000000000000000000000`。这不是凭据，但每个部署应使用自己的命名空间。
+   将返回的命名空间 ID 作为 `id` 字段写入 `wrangler.jsonc` 的 `kv_namespaces[0]`。仓库有意不预填 ID；每个部署必须使用自己的命名空间。
 
-3. 生成 32 字节随机加密密钥并写入 Cloudflare Secret。不要把输出保存进项目：
+3. 严格按“第 5 步”生成 `DATA_ENCRYPTION_KEY` 和 `BOOTSTRAP_ADMIN_PASSWORD`，写入系统临时 secrets JSON；缺少任一 Secret 时第一次部署必须失败，不能把密码写到 `vars`。
 
-   ```powershell
-   $bytes = New-Object byte[] 32
-   [Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
-   $value = [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+','-').Replace('/','_')
-   $value | npx wrangler secret put DATA_ENCRYPTION_KEY
-   Remove-Variable value,bytes
-   ```
+4. 按“第 6 步”使用 `wrangler deploy --secrets-file` 完成首次部署，并确保 `finally` 已删除临时文件。Worker 已存在后的 Secret 轮换才使用 `wrangler secret put`；不得轮换 `DATA_ENCRYPTION_KEY` 来修复读取问题。
 
-4. 默认配置会发布到 Cloudflare 分配的 `workers.dev` 域名。需要自定义域名时，在 `wrangler.jsonc` 顶层加入自己的路由，不能照抄他人的域名：
+5. 默认配置会发布到 Cloudflare 分配的 `workers.dev` 域名。需要自定义域名时，在 `wrangler.jsonc` 顶层加入自己的路由，不能照抄他人的域名：
 
    ```jsonc
    "routes": [
@@ -359,9 +369,9 @@ npx wrangler deployments list
    npx wrangler deploy
    ```
 
-5. 打开管理后台。全新 Durable Object 的初始密码是 `admin888`，首次登录必须修改，新密码至少 8 个字符。已经修改过密码的部署不会被重新初始化或覆盖。
+6. 打开管理后台，输入本次生成并保存的随机初始管理员密码；首次登录必须改为至少 12 个字符的新密码。已经修改过密码的部署不会被重新初始化或覆盖。
 
-6. 在“平台与账号”中完成 Microsoft OAuth 授权，再在“API 密钥”中创建客户端密钥。完整密钥只显示一次，关闭页面后无法恢复，只能撤销并重建。
+7. 在“平台与账号”中完成 Microsoft OAuth 授权，再在“API 密钥”中创建客户端密钥。完整密钥只显示一次，关闭页面后无法恢复，只能撤销并重建。
 
 ## OpenAI 兼容调用
 
@@ -427,7 +437,7 @@ npx wrangler secret list
 npx wrangler deployments list
 ```
 
-生产环境的长期 Secret 只允许 `DATA_ENCRYPTION_KEY`，以及启用固定出口时彼此独立的 `RELAY5_HMAC_SECRET`/`RELAY7_HMAC_SECRET`。账号批量迁移端点默认关闭，不能用管理员 Cookie 或普通 `m365_` API Key 调用。只有候选版本带有配置指定的临时版本标签、通过 Version Override 命中该候选、设置 `MIGRATION_ENABLED=true`，并使用独立 `MIGRATION_SIGNING_KEY` 对实际版本 ID、时间戳、nonce、路径和原始请求体签名时才可用。使用版本标签避免在版本上传前无法预知 Cloudflare 版本 UUID 的循环配置问题；请求仍必须同时声明并签名运行时实际版本 UUID。nonce 和 migration ID 都在 Durable Object 中防重放；完成验证后必须删除临时迁移签名 Secret，将迁移开关恢复为 `false`，并在晋升生产前移除临时能力。
+生产环境的长期 Secret 必须包含 `DATA_ENCRYPTION_KEY` 和 `BOOTSTRAP_ADMIN_PASSWORD`；启用固定出口时还需要彼此独立的 `RELAY5_HMAC_SECRET`/`RELAY7_HMAC_SECRET`。`BOOTSTRAP_ADMIN_PASSWORD` 只负责全新状态初始化，管理员改密后不能通过重部署覆盖密码。账号批量迁移端点默认关闭，不能用管理员 Cookie 或普通 `m365_` API Key 调用。只有候选版本带有配置指定的临时版本标签、通过 Version Override 命中该候选、设置 `MIGRATION_ENABLED=true`，并使用独立 `MIGRATION_SIGNING_KEY` 对实际版本 ID、时间戳、nonce、路径和原始请求体签名时才可用。使用版本标签避免在版本上传前无法预知 Cloudflare 版本 UUID 的循环配置问题；请求仍必须同时声明并签名运行时实际版本 UUID。nonce 和 migration ID 都在 Durable Object 中防重放；完成验证后必须删除临时迁移签名 Secret，将迁移开关恢复为 `false`，并在晋升生产前移除临时能力。
 
 迁移批次最多 40 个账号，按请求数组顺序写入，`activeSequence` 指定唯一活动账号；其余账号保持路由隔离，只有分类故障触发按序接棒。每个账号保存 `direct`、`relay5` 或 `relay7` 的出口策略标识，OAuthTokenSet 仍先经 AES-256-GCM 加密，再原子写入 Durable Object SQLite 并进入加密 KV 镜像队列。Cloudflare 不能直接拨号服务器版 SOCKS 出口，因此 `relay5`/`relay7` 使用本包 `optional-egress-relay/` 的固定目标 WebSocket 协议：分别配置 `RELAY5_URL`/`RELAY7_URL`、独立 HMAC Secret 和精确的 `RELAY_ORIGIN`。访问令牌只进入 TLS 请求头并被摘要与签名绑定，不出现在 relay URL；配置缺失或非法时会明确失败，绝不会静默降级为 Cloudflare 直连。迁移请求和响应都不得写入日志或保存为仓库文件。
 
@@ -438,6 +448,19 @@ GET /api/health
 ```
 
 它只返回平台与存储类型，不返回账号、密钥或令牌。管理 API 使用 `HttpOnly; Secure; SameSite=Lax` 会话 Cookie；模型 API 只接受服务端保存哈希的 API Key，OpenAI 客户端可用 Bearer 头，Anthropic 客户端可用 `x-api-key` 头。
+
+## 长任务与失败恢复
+
+所有 JSON 错误响应都带有稳定的 `X-M365-Error-Code`，流式错误则在终止事件中带同名 `error.code`。管理后台“诊断记录”会保存相同的脱敏错误码，但不会保存上游异常正文。排障时先看错误码，再决定动作：
+
+- `conversation_busy`：同一会话已有请求。等待 `Retry-After` 后重试一次；不要创建新任务并从头回放整个对话。
+- `account_busy`：活动账号队列繁忙，使用带抖动的指数退避；不要并发重放相同请求。
+- `upstream_timeout`：90 秒内没有语义进展或逻辑请求达到 10 分钟硬上限。网关会取消 Durable Object 内仍在运行的 ChatHub WebSocket并释放租约，客户端只续接当前失败步骤。
+- `upstream_auth_error`：刷新令牌已经失效，需要在后台重新进行 Microsoft OAuth 授权；增加并发或充值 Cloudflare 都不能修复它。
+- `upstream_disconnected` / `upstream_connect_error`：Microsoft ChatHub 连接中断或握手失败，可退避后重试一次；连续出现时切换健康账号并查看 Cloudflare 实时日志。
+- `repeated_tool_call` / `repeated_tool_failure` / `tool_round_limit`：程序化循环保护已经阻止原样重复。客户端必须保留上一条工具结果并改用不同工具或参数，不能把任务从第一步重新开始。
+
+流式响应每 5 秒发送保活，但空 SignalR 更新不再延长 90 秒的“真实进展”计时。客户端关闭连接、按下中断或 SSE 消费端取消时，取消信号会传入 ChatHub 所在 Durable Object；释放账号门控前会等待上游运行真正结束，防止上一条幽灵请求造成下一条 `409 Conflict`。
 
 ## 已知边界
 

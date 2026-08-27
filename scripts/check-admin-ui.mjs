@@ -44,9 +44,11 @@ const duplicateIds = [...new Set(ids.filter((id, index) => ids.indexOf(id) !== i
 if (duplicateIds.length > 0) throw new Error(`duplicate HTML ids: ${duplicateIds.join(", ")}`);
 if ((html.match(/id="createKeySubmit"/gu) ?? []).length !== 1) throw new Error("API Key modal must have exactly one submit button");
 
-if (!/admin888/u.test(login)) throw new Error("login page must show the admin888 bootstrap password");
-if ((login.match(/minlength="8"/gu) ?? []).length !== 2) throw new Error("both new-password inputs must enforce the 8-character minimum");
-if (/12 个字符|minlength="12"/u.test(login)) throw new Error("stale 12-character password copy must not remain");
+if (/admin888/u.test(login)) throw new Error("login page must not expose a shared bootstrap password");
+if (!/随机初始密码仅在部署终端显示一次/u.test(login)) throw new Error("login page must explain one-time random bootstrap credentials");
+if ((login.match(/minlength="12"/gu) ?? []).length !== 2) throw new Error("both new-password inputs must enforce the 12-character minimum");
+if (/8 个字符|minlength="8"/u.test(`${login}\n${html}`)) throw new Error("stale 8-character password copy must not remain");
+if (!/next\.length<12/u.test(html)) throw new Error("settings page must enforce the 12-character password minimum");
 
 if (!/sessionStorage\.setItem\('m365\.currentPage','logs'\)/u.test(debug)) throw new Error("legacy debug URL must route users to structured diagnostics");
 if (/JSON\.stringify|x\.client|x\.upstream|x\.gateway|undefined/u.test(debug)) throw new Error("debug compatibility page must not render raw or nonexistent payload fields");
