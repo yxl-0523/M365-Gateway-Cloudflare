@@ -98,6 +98,8 @@ export interface ToolLedgerSnapshotEntry {
   completedCount?: number;
   /** SHA-256 identities only; raw tool errors are never persisted. */
   failureFingerprints?: string[];
+  /** The same action produced the same failure at least twice. */
+  repeatedFailure?: boolean;
   /** Non-sensitive action categories retained for long-task completion evidence. */
   actions?: OperationalAction[];
 }
@@ -531,6 +533,13 @@ function addCompletedSnapshots(state: MutableLedgerState, snapshots: ToolLedgerS
       : [];
     const operationHints = classifyCompletionActions({ operationHints: snapshot.actions });
     for (const failureFingerprint of failureFingerprints) state.failureSignatures.add(`${fingerprint}\u0000${failureFingerprint}`);
+    if (snapshot.repeatedFailure === true) {
+      addIssue(state, {
+        code: "repeated_failure",
+        fingerprint,
+        message: `tool call ${name} repeated the same failure and must not be retried unchanged`,
+      });
+    }
     for (let occurrence = 0; occurrence < completedCount; occurrence += 1) {
       const callId = `persisted_${index}_${occurrence}_${fingerprint.slice(7, 19)}`;
       const call: ToolCallRecord = {
@@ -542,9 +551,10 @@ function addCompletedSnapshots(state: MutableLedgerState, snapshots: ToolLedgerS
         protocol: "seed",
         ...(operationHints.length > 0 ? { operationHints } : {}),
       };
-      state.callsById.set(callId, call);
-      state.calls.push(call);
-      state.consumedCallIds.add(callId);
+      // Persisted snapshots are historical evidence, not fresh calls in this
+      // continuation. Keeping them out of `calls` preserves duplicate/failure
+      // protection without permanently exhausting the per-request round
+      // budget and trapping automatic long-task continuations in a 409 loop.
       state.completed.push({
         ...call,
         result: "completed in a prior Responses turn",
@@ -674,13 +684,22 @@ export async function parseResponsesToolLedger(input: unknown, options: ToolLedg
 export function completedToolSnapshots(ledger: ToolLedger, maximum = 32): ToolLedgerSnapshotEntry[] {
   const limit = boundedInteger(maximum, 32, HARD_MAX_TOOL_ROUNDS);
   const unique = new Map<string, ToolLedgerSnapshotEntry>();
+  const repeatedFailures = new Set(ledger.issues
+    .filter((issue) => issue.code === "repeated_failure" && issue.fingerprint)
+    .map((issue) => issue.fingerprint!));
   for (const item of ledger.completed) {
     const previous = unique.get(item.fingerprint);
+    const priorFailureFingerprints = previous?.failureFingerprints ?? [];
     const actions = [...new Set([...(previous?.actions ?? []), ...classifyCompletionActions(item)])];
     const failureFingerprints = [...new Set([
-      ...(previous?.failureFingerprints ?? []),
+      ...priorFailureFingerprints,
       ...(item.failureFingerprint ? [item.failureFingerprint] : []),
     ])].slice(-2);
+    const repeatedFailure = Boolean(
+      previous?.repeatedFailure
+      || repeatedFailures.has(item.fingerprint)
+      || (item.failureFingerprint && priorFailureFingerprints.includes(item.failureFingerprint)),
+    );
     unique.delete(item.fingerprint);
     unique.set(item.fingerprint, {
       name: item.name,
@@ -691,6 +710,7 @@ export function completedToolSnapshots(ledger: ToolLedger, maximum = 32): ToolLe
       failed: item.failed,
       completedCount: Math.min(HARD_MAX_TOOL_ROUNDS, (previous?.completedCount ?? 0) + 1),
       ...(failureFingerprints.length > 0 ? { failureFingerprints } : {}),
+      ...(repeatedFailure ? { repeatedFailure: true } : {}),
       ...(actions.length > 0 ? { actions } : {}),
     });
   }

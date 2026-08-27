@@ -1480,9 +1480,10 @@ async function resolveFunctionCall(
   if (names.length === 0) throw new Error("TOOL_CALL_GENERATION_FAILED");
 
   // The native tool-enabled answer is already the first model decision. Permit
-  // one isolated repair only; more attempts increase latency and can detach the
-  // selected action from the caller's evidence.
-  for (let attempt = 0; attempt < 1; attempt += 1) {
+  // two bounded repairs so one malformed router response cannot terminate a
+  // long task and make the client restart it. Every proposal still passes the
+  // fingerprint guard, total round limit and logical request deadline.
+  for (let attempt = 0; attempt < 2; attempt += 1) {
     if (Date.now() >= logicalDeadline) throw new Error("CHAT_DEADLINE_EXCEEDED");
     const recoveryConstraint = recoveryReason
       ? `RECOVERY CONSTRAINT: ${recoveryReason}. Select a different tool or materially different arguments. Never repeat the blocked action.\n`
@@ -1667,9 +1668,13 @@ async function resolveAssistantTurn(
 
   const completionDecision = evaluateCompletionEvidence(result.text, completionLedger);
   if (!completionDecision.allowed
-    && ["missing_evidence", "unknown_evidence"].includes(completionDecision.reason)
+    && ["failed_evidence", "missing_evidence", "unknown_evidence"].includes(completionDecision.reason)
     && toolRoutingEnabled(tools, toolChoice)) {
-    const recoveryPrompt = `${prompt}\n\nCOMPLETION EVIDENCE RECOVERY: The ordinary answer asserted completion without matching successful client-tool evidence (${completionDecision.unsupportedActions.join(", ")}). Do not repeat that answer. Select the next materially useful client tool action needed to continue or verify the user's current task. Do not repeat a completed inspection unchanged, and do not perform a mutation outside the user's request.`;
+    const failureContext = completionDecision.reason === "failed_evidence"
+      ? "The latest matching client-tool action failed. Continue from that exact failure and use its result; do not restart the task or repeat the initial discovery steps."
+      : "The completion claim does not yet have matching successful client-tool evidence.";
+    const recoveryPrompt = `${prompt}\n\nCOMPLETION EVIDENCE RECOVERY: ${failureContext} The unsupported completion actions are: ${completionDecision.unsupportedActions.join(", ")}. Do not repeat the completion answer. Select the next materially useful client tool action needed to repair or verify the current task. Change the tool or arguments when the previous action failed, do not repeat a completed inspection unchanged, and do not perform a mutation outside the user's request.`;
+    const recoveryToolChoice = typeof toolChoice === "object" && toolChoice ? toolChoice : "required";
     const recoveryCall = await resolveFunctionCall(
       env,
       account,
@@ -1677,7 +1682,7 @@ async function resolveAssistantTurn(
       recoveryPrompt,
       tone,
       tools,
-      toolChoice,
+      recoveryToolChoice,
       ledger,
       signal,
       gateLifecycle,
@@ -1908,6 +1913,7 @@ async function chatCompletions(request: Request, env: Env, metrics?: RequestMetr
   let attachments: NormalizedImageAttachment[] = [];
   let promptLimit = 0;
   let promptTokenLimit = 0;
+  let recoveredRepeatedProposal = false;
   try {
     const activeMessages = selectActiveChatMessages(parsed.messages, lease.started);
     const prepared = prepareChatMultimodal(activeMessages);
@@ -1915,12 +1921,7 @@ async function chatCompletions(request: Request, env: Env, metrics?: RequestMetr
     const parsedLedger = await parseChatToolLedger(prepared.value);
     ledger = recoverRepeatedPendingProposal(parsedLedger);
     completionLedger = await parseChatCompletionEvidenceLedger(parsed.messages);
-    if (recoveredRepeatedPendingProposal(parsedLedger, ledger)) {
-      const reason = toolGuardFailure("completed_call_reissued").publicMessage;
-      await session.release(lease.leaseId);
-      metrics?.observeOutputText(toolRecoveryTermination(reason));
-      return localChatTerminal(model, toolRecoveryTermination(reason), Boolean(parsed.stream));
-    }
+    recoveredRepeatedProposal = recoveredRepeatedPendingProposal(parsedLedger, ledger);
     const ledgerFailure = toolLedgerPreflight(ledger);
     if (ledgerFailure) {
       await session.release(lease.leaseId);
@@ -1936,7 +1937,10 @@ async function chatCompletions(request: Request, env: Env, metrics?: RequestMetr
       promptLimit,
       promptTokenLimit,
     );
-    currentTurnPrompt = `${anchorBudget.prefix}${chatPrompt(prepared.value, anchorBudget.promptCharacters, anchorBudget.promptTokens)}${evidence ? `\n\n${evidence}` : ""}`;
+    const recoveryContext = recoveredRepeatedProposal
+      ? "\n\nTOOL CONTINUATION RECOVERY: The latest proposed client action repeated an already completed or repeatedly failed action and was rejected. Stay on the current task, preserve all progress, and select a materially different next action or different arguments. Do not restart the audit or repeat the initial inspection."
+      : "";
+    currentTurnPrompt = `${anchorBudget.prefix}${chatPrompt(prepared.value, anchorBudget.promptCharacters, anchorBudget.promptTokens)}${evidence ? `\n\n${evidence}` : ""}${recoveryContext}`;
     prompt = currentTurnPrompt;
   } catch (cause) {
     await session.release(lease.leaseId);
@@ -2322,6 +2326,7 @@ async function responsesCore(request: Request, env: Env, metrics?: RequestMetric
   let attachments: NormalizedImageAttachment[] = [];
   let promptLimit = 0;
   let promptTokenLimit = 0;
+  let recoveredRepeatedProposal = false;
   try {
     const activeInput = selectActiveResponsesInput(parsed.input, lease.started, {
       previousResponse: Boolean(parsed.previous_response_id) || statelessToolContinuation,
@@ -2338,12 +2343,7 @@ async function responsesCore(request: Request, env: Env, metrics?: RequestMetric
       }] : [],
     });
     ledger = recoverRepeatedPendingProposal(parsedLedger);
-    if (recoveredRepeatedPendingProposal(parsedLedger, ledger)) {
-      const reason = toolGuardFailure("completed_call_reissued").publicMessage;
-      await session.release(lease.leaseId);
-      metrics?.observeOutputText(toolRecoveryTermination(reason));
-      return localResponsesTerminal(responseId, model, toolRecoveryTermination(reason), Boolean(parsed.stream));
-    }
+    recoveredRepeatedProposal = recoveredRepeatedPendingProposal(parsedLedger, ledger);
     const ledgerFailure = toolLedgerPreflight(ledger);
     if (ledgerFailure) {
       await session.release(lease.leaseId);
@@ -2359,7 +2359,10 @@ async function responsesCore(request: Request, env: Env, metrics?: RequestMetric
       promptLimit,
       promptTokenLimit,
     );
-    currentTurnPrompt = `${anchorBudget.prefix}${responsesPrompt(prepared.value, anchorBudget.promptCharacters, anchorBudget.promptTokens)}${evidence ? `\n\n${evidence}` : ""}`;
+    const recoveryContext = recoveredRepeatedProposal
+      ? "\n\nTOOL CONTINUATION RECOVERY: The latest proposed client action repeated an already completed or repeatedly failed action and was rejected. Stay on the current task, preserve all progress, and select a materially different next action or different arguments. Do not restart the audit or repeat the initial inspection."
+      : "";
+    currentTurnPrompt = `${anchorBudget.prefix}${responsesPrompt(prepared.value, anchorBudget.promptCharacters, anchorBudget.promptTokens)}${evidence ? `\n\n${evidence}` : ""}${recoveryContext}`;
     prompt = currentTurnPrompt;
   } catch (cause) {
     await session.release(lease.leaseId);
