@@ -8,7 +8,10 @@ const deployments = JSON.stringify([
   },
   {
     created_on: "2026-08-27T07:18:00Z",
-    versions: [{ version_id: "22222222-2222-4222-8222-222222222222", percentage: 100 }],
+    versions: [
+      { version_id: "33333333-3333-4333-8333-333333333333", percentage: 10 },
+      { version_id: "22222222-2222-4222-8222-222222222222", percentage: 90 },
+    ],
   },
 ]);
 

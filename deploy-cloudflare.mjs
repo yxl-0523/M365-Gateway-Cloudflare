@@ -123,7 +123,11 @@ export function deployedVersionId(output) {
     return selected;
   }, null);
   const versions = Array.isArray(latest?.versions) ? latest.versions : [];
-  const versionId = versions.find((item) => typeof item?.version_id === "string")?.version_id
+  const activeVersion = versions.reduce((selected, candidate) => {
+    if (typeof candidate?.version_id !== "string") return selected;
+    return !selected || Number(candidate.percentage ?? 0) > Number(selected.percentage ?? 0) ? candidate : selected;
+  }, null);
+  const versionId = activeVersion?.version_id
     ?? (typeof latest?.version_id === "string" ? latest.version_id : "");
   if (!/^[0-9a-f-]{32,36}$/iu.test(versionId)) throw new Error("无法从 Wrangler deployment 清单确认当前生产 version ID");
   return versionId;
