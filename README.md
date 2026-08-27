@@ -112,6 +112,42 @@ Remove-Item Env:M365_TEST_API_KEY,Env:M365_TEST_MODELS,Env:M365_TEST_SCOPE -Erro
 
 下面是从空目录到可以发起第一条 API 请求的完整流程。建议严格按顺序执行；每一步都给出了成功判据和失败时应检查的地方。
 
+### JavaScript 一键部署（推荐新用户）
+
+项目根目录提供 `deploy-cloudflare.mjs`，仅依赖 Node.js 内置模块。它会自动安装锁定依赖、打开 Cloudflare 官方登录、创建独立 KV、生成不回显的 32 字节加密 Secret、运行完整检查、生成临时部署配置并发布 Worker。临时配置和 Secret 位于系统临时目录，无论成功失败都会删除，不会写入 Git。
+
+进入项目目录后只需运行：
+
+```powershell
+node .\deploy-cloudflare.mjs
+```
+
+按提示填写：
+
+1. Worker 名称，例如 `my-m365-gateway`；
+2. Microsoft Entra Application (client) ID；
+3. 可选的 Cloudflare 自定义域名，例如 `api.example.com`。
+
+无人值守新建部署可使用：
+
+```powershell
+node .\deploy-cloudflare.mjs --yes --name my-m365-gateway --client-id "你的-Entra-Application-ID"
+```
+
+更新已有 Worker 时必须复用原 KV；脚本不会生成新的 `DATA_ENCRYPTION_KEY`，Cloudflare 会保留现有 Secret：
+
+```powershell
+node .\deploy-cloudflare.mjs --update --name my-m365-gateway --client-id "原-Entra-Application-ID" --kv-id "原-SENSITIVE_KV-ID"
+```
+
+部署前只验证构建、不登录或创建 Cloudflare 资源：
+
+```powershell
+node .\deploy-cloudflare.mjs --dry-run --yes --name m365-gateway-check --client-id "00000000-0000-4000-8000-000000000001"
+```
+
+安全限制：已有部署不得改用新 KV，也不得重新生成 `DATA_ENCRYPTION_KEY`，否则已有 OAuth 密文将无法读取。一键脚本不会自动完成 Microsoft OAuth；部署结束后仍需进入管理后台修改初始密码、添加账号并创建客户端 API Key。
+
 ### 第 0 步：准备环境
 
 1. 安装 Node.js 20 或更高版本（建议当前 LTS），安装完成后重新打开终端。

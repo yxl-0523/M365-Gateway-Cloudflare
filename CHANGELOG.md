@@ -2,6 +2,7 @@
 
 ## 0.1.0 - 2026-08-26
 
+- 增加 `deploy-cloudflare.mjs` JavaScript 一键部署器，自动创建 KV、生成加密 Secret、检查并部署 Worker；更新模式强制复用原 KV 与 Secret。
 - 首个明确标注的 Cloudflare 原生开源版本。
 - 提供 OpenAI Chat Completions、Responses 与 Anthropic Messages 兼容接口。
 - 提供 Durable Objects 会话/账户状态、KV 加密凭据镜像和同域管理后台。
