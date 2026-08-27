@@ -10,7 +10,7 @@
     "check:ui": "node scripts/check-admin-ui.mjs",
     "deploy": "wrangler deploy",
     "deploy:one-click": "node deploy-cloudflare.mjs",
-    "deploy:dry": "wrangler deploy --dry-run",
+    "deploy:dry": "node deploy-cloudflare.mjs --dry-run --yes --client-id 00000000-0000-4000-8000-000000000001",
     "deploy:temporary": "wrangler deploy --temporary",
     "dev": "wrangler dev",
     "typecheck": "tsc --noEmit",

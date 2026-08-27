@@ -45,6 +45,13 @@ describe("stable protocol errors", () => {
     });
   });
 
+  it("maps a Durable Object duplicate run to a retryable conversation conflict", () => {
+    expect(publicFailure(new Error("CHAT_RUN_ALREADY_ACTIVE"))).toEqual({
+      code: "conversation_busy",
+      message: "this conversation already has an active request",
+    });
+  });
+
   it("rejects mismatched Responses tool outputs", () => {
     expect(responsesContinuationOutputIssue([
       { type: "function_call_output", call_id: "wrong", output: "ok" },

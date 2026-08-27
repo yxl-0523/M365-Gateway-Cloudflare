@@ -56,9 +56,14 @@ M365 Gateway Cloudflare 一键部署器
 }
 
 function run(command, commandArgs, options = {}) {
+  const timeoutMs = options.timeoutMs ?? 180_000;
   const result = spawnSync(command, commandArgs, {
     cwd: root,
     encoding: "utf8",
+    // A stuck Wrangler child must fail the deployment task instead of leaving
+    // Codex waiting forever with no evidence. Real deployments are bounded by
+    // the same limit; rerun after inspecting the emitted command/error.
+    timeout: timeoutMs,
     stdio: options.capture ? [options.input ? "pipe" : "ignore", "pipe", "pipe"] : [options.input ? "pipe" : "inherit", "inherit", "inherit"],
     input: options.input,
     env: process.env,
@@ -67,7 +72,10 @@ function run(command, commandArgs, options = {}) {
     if (result.stdout) process.stdout.write(result.stdout);
     if (result.stderr) process.stderr.write(result.stderr);
   }
-  if (result.error) throw result.error;
+  if (result.error) {
+    if (result.error.code === "ETIMEDOUT") throw new Error(`${command} ${commandArgs.join(" ")} 超过 ${Math.ceil(timeoutMs / 1_000)} 秒仍未退出，已终止`);
+    throw result.error;
+  }
   if (result.status !== 0) throw new Error(`${command} ${commandArgs.join(" ")} 执行失败（退出码 ${result.status ?? "unknown"}）`);
   return `${result.stdout ?? ""}${result.stderr ?? ""}`;
 }

@@ -328,18 +328,22 @@ class ToolLedgerBlockedError extends Error {
 function toolGuardFailure(code: ToolLedgerIssueCode | "pending_tool_result"): ToolLedgerBlockedError {
   switch (code) {
     case "repeated_failure":
-      return new ToolLedgerBlockedError("repeated_tool_failure", "the same tool action failed again; inspect the last result and change the action before retrying", 409);
+      // This is a deterministic client-protocol violation, not a transient
+      // conversation conflict. Returning 409 makes several OpenAI-compatible
+      // clients retry the exact same request and creates the loop that ends in
+      // `tool_round_limit`.
+      return new ToolLedgerBlockedError("repeated_tool_failure", "the same tool action failed again; inspect the last result and change the action before retrying", 400);
     case "completed_call_reissued":
     case "duplicate_completed_result":
     case "duplicate_pending_call":
     case "consecutive_fingerprint_limit":
-      return new ToolLedgerBlockedError("repeated_tool_call", "the same tool action was already completed or proposed; do not issue it again unchanged", 409);
+      return new ToolLedgerBlockedError("repeated_tool_call", "the same tool action was already completed or proposed; do not issue it again unchanged", 400);
     case "tool_round_limit":
-      return new ToolLedgerBlockedError("tool_round_limit", "the bounded tool-call limit for this user task has been reached", 409);
+      return new ToolLedgerBlockedError("tool_round_limit", "the bounded tool-call limit for this user task has been reached", 400);
     case "pending_tool_result":
-      return new ToolLedgerBlockedError("pending_tool_result", "return the pending tool result before requesting another tool call", 409);
+      return new ToolLedgerBlockedError("pending_tool_result", "return the pending tool result before requesting another tool call", 400);
     case "call_id_already_consumed":
-      return new ToolLedgerBlockedError("tool_output_already_consumed", "this call_id has already consumed a tool result", 409);
+      return new ToolLedgerBlockedError("tool_output_already_consumed", "this call_id has already consumed a tool result", 400);
     case "unknown_call_id":
       return new ToolLedgerBlockedError("tool_output_mismatch", "the tool result references an unknown call_id", 400);
     default:
@@ -447,6 +451,7 @@ export function publicFailure(cause: unknown): { code: string; message: string }
   if (raw === "ACCOUNT_CREDENTIAL_MISSING" || raw === "ACCOUNT_CREDENTIAL_CORRUPT" || raw === "ACCOUNT_CREDENTIAL_MIRROR_UNAVAILABLE") return { code: "account_credential_error", message: "the selected Microsoft 365 account credential is unavailable" };
   if (raw === "ACCOUNT_RELAY_EGRESS_UNAVAILABLE") return { code: "account_egress_unavailable", message: "the selected Microsoft 365 account is assigned to an unavailable relay; switch it to direct Cloudflare egress or restore that relay" };
   if (raw === "ACCOUNT_QUEUE_TIMEOUT") return { code: "account_busy", message: "the Microsoft 365 account is busy; retry later" };
+  if (raw === "CONVERSATION_BUSY" || raw === "CHAT_RUN_ALREADY_ACTIVE") return { code: "conversation_busy", message: "this conversation already has an active request" };
   if (raw === "NO_HEALTHY_ACCOUNT" || raw === "SESSION_ACCOUNT_COOLDOWN") return { code: "account_cooldown", message: "all eligible Microsoft 365 accounts are cooling down; retry later" };
   if (raw === "NO_USABLE_ACCOUNT") return { code: "account_pool_isolated", message: "all Microsoft 365 accounts require administrator attention" };
   if (raw === "CHAT_THROTTLED_QUOTA_EXHAUSTED") return { code: "upstream_throttled", message: "the selected Microsoft 365 account has exhausted its current allowance" };
@@ -2672,6 +2677,7 @@ export async function openAIRequest(
     if (code === "NO_USABLE_ACCOUNT") return apiError(503, "account_pool_isolated", "all Microsoft 365 accounts require administrator attention");
     if (code === "SESSION_ACCOUNT_ISOLATED" || code === "SESSION_ACCOUNT_MISSING") return apiError(503, "session_account_unavailable", "the account bound to this conversation is unavailable");
     if (code === "CONVERSATION_BUSY") return apiError(409, "conversation_busy", "this conversation already has an active request", { "Retry-After": "1" });
+    if (code === "CHAT_RUN_ALREADY_ACTIVE") return apiError(409, "conversation_busy", "this conversation already has an active request", { "Retry-After": "1" });
     if (code === "ACCOUNT_QUEUE_TIMEOUT") return apiError(429, "account_busy", "the Microsoft 365 account is busy; retry later");
     if (code === "CHAT_THROTTLED_QUOTA_EXHAUSTED") return apiError(429, "upstream_throttled", "the selected Microsoft 365 account has exhausted its current allowance");
     if (code === "UNSUPPORTED_MODEL") return apiError(400, "unsupported_model", "the requested model is not supported by this gateway");
