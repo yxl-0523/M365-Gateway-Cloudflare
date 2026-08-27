@@ -14,7 +14,7 @@ const root = path.dirname(fileURLToPath(import.meta.url));
 const npm = process.platform === "win32" ? "npm.cmd" : "npm";
 const wranglerEntry = path.join(root, "node_modules", "wrangler", "bin", "wrangler.js");
 const args = parseArgs(process.argv.slice(2));
-const rl = createInterface({ input: process.stdin, output: process.stdout });
+let rl;
 let temporaryDirectory = "";
 
 function parseArgs(values) {
@@ -109,6 +109,57 @@ function parseWranglerJSON(output) {
   throw new Error("Wrangler 返回了无法解析的 JSON");
 }
 
+export function deployedVersionId(output) {
+  const parsed = parseWranglerJSON(output);
+  const deployments = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.deployments) ? parsed.deployments : [];
+  const latest = deployments.reduce((selected, candidate) => {
+    if (!selected) return candidate;
+    const selectedAt = Date.parse(String(selected?.created_on ?? ""));
+    const candidateAt = Date.parse(String(candidate?.created_on ?? ""));
+    if (Number.isFinite(candidateAt) && (!Number.isFinite(selectedAt) || candidateAt > selectedAt)) return candidate;
+    // Wrangler currently emits oldest-to-newest. If timestamps are absent or
+    // invalid, prefer the later array entry rather than the oldest deployment.
+    if (!Number.isFinite(candidateAt) && !Number.isFinite(selectedAt)) return candidate;
+    return selected;
+  }, null);
+  const versions = Array.isArray(latest?.versions) ? latest.versions : [];
+  const versionId = versions.find((item) => typeof item?.version_id === "string")?.version_id
+    ?? (typeof latest?.version_id === "string" ? latest.version_id : "");
+  if (!/^[0-9a-f-]{32,36}$/iu.test(versionId)) throw new Error("无法从 Wrangler deployment 清单确认当前生产 version ID");
+  return versionId;
+}
+
+export function deployedBaseURL(output, domain) {
+  if (domain) return `https://${domain}`;
+  const urls = output.match(/https:\/\/[a-z0-9.-]+\.workers\.dev\b/giu) ?? [];
+  const url = urls.at(-1) ?? "";
+  if (!url) throw new Error("Wrangler 未返回 workers.dev 地址，无法执行部署后健康检查");
+  return url.replace(/\/$/u, "");
+}
+
+async function verifyDeployment(baseURL) {
+  let last = "";
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const response = await fetch(`${baseURL}/api/health`, {
+        headers: { Accept: "application/json", "User-Agent": "m365-gateway-deploy-smoke/1" },
+        signal: AbortSignal.timeout(15_000),
+      });
+      const body = await response.text();
+      if (response.ok) {
+        let value;
+        try { value = JSON.parse(body); } catch { /* validated below */ }
+        if (value && typeof value === "object") return;
+        last = "健康接口没有返回 JSON";
+      } else last = `健康接口返回 HTTP ${response.status}`;
+    } catch (error) {
+      last = error instanceof Error ? error.message : String(error);
+    }
+    if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 1_000));
+  }
+  throw new Error(`部署后健康检查失败：${last || "unknown error"}`);
+}
+
 function configuredSecretNames(configPath) {
   const output = runWrangler(["secret", "list", "--config", configPath, "--format", "json"], { capture: true });
   const parsed = parseWranglerJSON(output);
@@ -118,6 +169,7 @@ function configuredSecretNames(configPath) {
 
 async function ask(question, fallback = "") {
   if (args.yes) return fallback;
+  if (!rl) throw new Error("部署器交互终端尚未初始化");
   const suffix = fallback ? ` [${fallback}]` : "";
   return (await rl.question(`${question}${suffix}: `)).trim() || fallback;
 }
@@ -207,6 +259,7 @@ async function ensureCloudflareLogin() {
 }
 
 async function main() {
+  rl = createInterface({ input: process.stdin, output: process.stdout });
   if (args.help) {
     showHelp();
     return;
@@ -235,6 +288,7 @@ async function main() {
   let kvId = args.kv_id ?? "";
   let bootstrapPassword = "";
   let secretsForDeploy = {};
+  let previousVersionId = "";
 
   if (args.update) {
     if (!kvId || /^0{32}$/u.test(kvId)) kvId = await ask("粘贴现有 SENSITIVE_KV namespace ID", "");
@@ -267,6 +321,8 @@ async function main() {
     console.log("加密密钥和随机初始管理员密码已生成；不会写入项目目录。");
   } else {
     console.log("\n[3/7] 更新模式：检查并复用现有 KV 与 Secret。");
+    previousVersionId = deployedVersionId(runWrangler(["deployments", "list", "--config", configPath, "--json"], { capture: true }));
+    console.log(`已记录当前生产版本：${previousVersionId}`);
     const secretNames = configuredSecretNames(configPath);
     if (!secretNames.has("DATA_ENCRYPTION_KEY")) {
       throw new Error("现有 Worker 缺少 DATA_ENCRYPTION_KEY；为避免破坏已有 OAuth 密文，已停止更新");
@@ -289,10 +345,24 @@ async function main() {
   console.log("\n[6/7] 部署 Cloudflare Worker…");
   const deployArgs = ["deploy", "--config", configPath, "--keep-vars", "--message", "one-click Cloudflare deployment"];
   if (Object.keys(secretsForDeploy).length > 0) deployArgs.push("--secrets-file", secretPath);
-  runWrangler(deployArgs);
+  const deployOutput = runWrangler(deployArgs, { capture: true });
+
+  const baseURL = deployedBaseURL(deployOutput, domain);
+  console.log(`正在验证：${baseURL}/api/health`);
+  try {
+    await verifyDeployment(baseURL);
+  } catch (error) {
+    if (args.update && previousVersionId) {
+      console.error("新版本健康检查失败，正在回滚到部署前版本…");
+      runWrangler(["rollback", previousVersionId, "--config", configPath, "--yes", "--message", "automatic rollback after failed health check"]);
+      throw new Error(`${error instanceof Error ? error.message : String(error)}；已回滚到 ${previousVersionId}`);
+    }
+    throw error;
+  }
 
   console.log("\n[7/7] 部署完成");
   console.log(`Worker：${workerName}`);
+  console.log(`健康检查：${baseURL}/api/health（通过）`);
   if (domain) console.log(`管理后台：https://${domain}/`);
   else console.log("管理后台地址请使用上方 Wrangler 输出的 workers.dev URL。");
   if (bootstrapPassword) console.log(`本次生成的初始管理员密码（仅显示一次）：${bootstrapPassword}`);
@@ -300,12 +370,15 @@ async function main() {
   console.log("首次登录后必须立即修改管理员密码，然后添加 Microsoft 365 账号并创建 API Key。");
 }
 
-try {
-  await main();
-} catch (error) {
-  console.error(`\n部署失败：${error instanceof Error ? error.message : String(error)}`);
-  process.exitCode = 1;
-} finally {
-  rl.close();
-  if (temporaryDirectory) await rm(temporaryDirectory, { recursive: true, force: true });
+const invokedAsScript = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (invokedAsScript) {
+  try {
+    await main();
+  } catch (error) {
+    console.error(`\n部署失败：${error instanceof Error ? error.message : String(error)}`);
+    process.exitCode = 1;
+  } finally {
+    rl?.close();
+    if (temporaryDirectory) await rm(temporaryDirectory, { recursive: true, force: true });
+  }
 }

@@ -5,7 +5,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "check": "npm run check:no-docs && npm run types && npm run typecheck && npm run check:ui && npm test && npm run deploy:dry",
+    "check": "npm run check:no-docs && npm run check:deploy && npm run types && npm run typecheck && npm run check:ui && npm test && npm run deploy:dry",
+    "check:deploy": "node scripts/check-deploy-helpers.mjs",
     "check:no-docs": "node scripts/check-no-docs.mjs",
     "check:ui": "node scripts/check-admin-ui.mjs",
     "deploy": "wrangler deploy",
