@@ -1,6 +1,6 @@
 # M365 Gateway Cloudflare 原生开源版（CF 版）
 
-版本：`0.1.1`  
+版本：`0.1.1`
 部署形态：Cloudflare Workers + Static Assets + Durable Objects + KV
 
 这是完全运行在 Cloudflare 上的独立部署形态。Worker 直接连接 Microsoft 365 ChatHub，不依赖 VPS、Nginx、Docker、Cloudflare Tunnel 或任何本机/服务器源站，也不使用代理。
