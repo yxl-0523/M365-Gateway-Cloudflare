@@ -14,6 +14,7 @@ const DEFAULT_EVIDENCE_CHARACTERS = 8_000;
 const HARD_MAX_EVIDENCE_CHARACTERS = 32_000;
 
 const failureSignal = /(?:exit\s*(?:code|status)?\s*[:=]?\s*[1-9]\d*|\berror\b|\bfailed\b|\bfailure\b|exception|traceback|timed?\s*out|permission denied|not found|refused|\u9519\u8bef|\u5931\u8d25|\u8d85\u65f6|\u62d2\u7edd|\u65e0\u6743\u9650|\u627e\u4e0d\u5230|\u4e0d\u5b58\u5728)/iu;
+const processExitSignal = /(?:^|\n)Process exited with code\s+(-?\d+)(?:\s|$)/iu;
 
 export type ToolProtocol = "chat" | "responses" | "seed";
 
@@ -362,6 +363,16 @@ function normalizeFailure(value: string): string {
   return normalizeResult(value).toLowerCase().replace(/\d+/gu, "#").slice(0, 1_000);
 }
 
+function resultFailed(value: string): boolean {
+  // exec_command places its authoritative process result in the tool envelope,
+  // before command stdout. A successful test may legitimately print words such
+  // as ERROR, refused, or failed while exercising fallback/error paths; those
+  // strings must not override an explicit outer exit code of zero.
+  const processExit = processExitSignal.exec(value.slice(0, 1_024));
+  if (processExit) return Number(processExit[1]) !== 0;
+  return failureSignal.test(value);
+}
+
 function addIssue(state: MutableLedgerState, issue: ToolLedgerIssue): void {
   if (state.issues.some((current) => current.code === issue.code && current.callId === issue.callId && current.fingerprint === issue.fingerprint)) return;
   state.issues.push(issue);
@@ -478,7 +489,7 @@ async function consumeResult(
   const result = resultText(value);
   const normalizedResult = normalizeResult(result);
   const resultFingerprint = `sha256:${await sha256(normalizedResult)}`;
-  const failed = failedOverride ?? failureSignal.test(normalizedResult);
+  const failed = failedOverride ?? resultFailed(normalizedResult);
   const evidence: CompletedToolEvidence = { ...call, result, normalizedResult, resultFingerprint, failed };
   let failureFingerprint: string | undefined;
   if (failed) {
@@ -674,7 +685,10 @@ export function completedToolSnapshots(ledger: ToolLedger, maximum = 32): ToolLe
     unique.set(item.fingerprint, {
       name: item.name,
       fingerprint: item.fingerprint,
-      failed: Boolean(previous?.failed || item.failed),
+      // The latest execution is authoritative. Historical failure signatures
+      // remain separately retained for loop prevention, but must not poison a
+      // later successful repair and verification.
+      failed: item.failed,
       completedCount: Math.min(HARD_MAX_TOOL_ROUNDS, (previous?.completedCount ?? 0) + 1),
       ...(failureFingerprints.length > 0 ? { failureFingerprints } : {}),
       ...(actions.length > 0 ? { actions } : {}),

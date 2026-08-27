@@ -957,6 +957,25 @@ export async function accountForLease(
   }
 }
 
+async function acquireConversationLease(
+  session: DurableObjectStub<ChatSession>,
+  deadlineAt: number,
+  signal?: AbortSignal,
+): Promise<ChatLease> {
+  for (;;) {
+    if (signal?.aborted) throw new Error("REQUEST_ABORTED");
+    try {
+      return await session.acquire();
+    } catch (cause) {
+      const code = cause instanceof Error ? cause.message : String(cause);
+      if (code !== "CONVERSATION_BUSY") throw cause;
+      const remaining = deadlineAt - Date.now();
+      if (remaining <= 0) throw new Error("CONVERSATION_BUSY");
+      await abortableDelay(Math.min(250, remaining), signal);
+    }
+  }
+}
+
 function abortableDelay(milliseconds: number, signal?: AbortSignal): Promise<void> {
   if (signal?.aborted) return Promise.reject(new Error("REQUEST_ABORTED"));
   return new Promise((resolve, reject) => {
@@ -1881,7 +1900,7 @@ async function chatCompletions(request: Request, env: Env, metrics?: RequestMetr
   const model = canonicalModel(parsed.model);
   const tone = modelTone(model, parsed.reasoning_effort ?? "");
   const session = chatSession(env, await chatSessionKey(request, parsed));
-  const lease = await session.acquire();
+  const lease = await acquireConversationLease(session, deadlineAt, request.signal);
   let ledger: ToolLedger;
   let completionLedger: ToolLedger;
   let prompt: string;
@@ -2273,7 +2292,7 @@ async function responsesCore(request: Request, env: Env, metrics?: RequestMetric
   const key = await responsesSessionKey(request, parsed);
   const responseSessionKey = await scopedOpaqueKey(request, "m365-response-id", responseId);
   const session = chatSession(env, key);
-  const lease = await session.acquire();
+  const lease = await acquireConversationLease(session, deadlineAt, request.signal);
   const portableBaseTail = lease.portableProtocolTail;
   if (parsed.previous_response_id && !lease.started) {
     await session.release(lease.leaseId);
@@ -2512,7 +2531,7 @@ async function imageGenerations(request: Request, env: Env, metrics?: RequestMet
   metrics?.observeInputText(normalized.prompt);
 
   const session = chatSession(env, `image-generation:${crypto.randomUUID()}`);
-  const lease = await session.acquire();
+  const lease = await acquireConversationLease(session, deadlineAt, request.signal);
   let account: AccountSelection;
   try {
     const resolution = await accountForLease(env, session, lease);
