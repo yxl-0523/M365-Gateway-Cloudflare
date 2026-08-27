@@ -429,7 +429,7 @@ export function publicFailure(cause: unknown): { code: string; message: string }
   if (raw.startsWith("RELAY_DIAL_FAILED:") || raw === "RELAY_DIAL_ERROR") return { code: "upstream_relay_error", message: "the configured egress relay could not connect to Microsoft ChatHub" };
   if (raw.startsWith("WS_HANDSHAKE_")) return { code: "upstream_connect_error", message: "Microsoft ChatHub rejected or returned an invalid realtime handshake" };
   if (raw.startsWith("WS_CLOSED_BEFORE_COMPLETION") || raw.startsWith("CHAT_CLOSED_BEFORE_COMPLETION") || raw === "WS_ERROR_BEFORE_COMPLETION") return { code: "upstream_disconnected", message: "Microsoft ChatHub disconnected before completion" };
-  if (raw === "WS_READ_TIMEOUT" || raw === "CHAT_DEADLINE_EXCEEDED") return { code: "upstream_timeout", message: "Microsoft ChatHub timed out before completion" };
+  if (raw === "WS_READ_TIMEOUT" || raw === "CHAT_DEADLINE_EXCEEDED" || raw === "CHAT_PROGRESS_TIMEOUT") return { code: "upstream_timeout", message: "Microsoft ChatHub timed out before completion" };
   if (["WS_FRAME_TOO_LARGE", "WS_BUFFER_TOO_LARGE", "CHAT_OUTPUT_TOO_LARGE", "CHAT_IMAGE_OUTPUT_TOO_LARGE"].includes(raw)) return { code: "upstream_payload_too_large", message: "Microsoft ChatHub exceeded the gateway's bounded frame or output limit" };
   if (raw === "INVALID_CHAT_HUB_ATTACHMENTS") return { code: "invalid_upstream_attachment", message: "the normalized image attachment could not be encoded for Microsoft ChatHub" };
   if (raw.startsWith("CHAT_COMPLETION_ERROR") || raw.startsWith("CHAT_UPSTREAM_ERROR") || raw === "CHAT_RETURNED_NO_CONTENT") return { code: "upstream_response_error", message: "Microsoft ChatHub returned an incomplete or failed response" };

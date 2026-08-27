@@ -70,6 +70,7 @@ export function classifyAccountFailure(cause: unknown): AccountFailureDispositio
     || upper === "WS_READ_TIMEOUT"
     || upper.startsWith("CHAT_CLOSED_BEFORE_COMPLETION")
     || upper === "CHAT_DEADLINE_EXCEEDED"
+    || upper === "CHAT_PROGRESS_TIMEOUT"
     || upper === "CHAT_RETURNED_NO_CONTENT"
   ) {
     return { kind: "transient", mayFailOverBeforeVisibleOutput: true };

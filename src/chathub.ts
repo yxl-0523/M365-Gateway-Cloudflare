@@ -16,6 +16,11 @@ const MAX_FRAME_CHARACTERS = 4_000_000;
 const MAX_OUTPUT_CHARACTERS = 8_000_000;
 const MAX_QUEUED_SOCKET_CHARACTERS = 8_000_000;
 const MAX_UPSTREAM_IMAGE_URL_CHARACTERS = 6 * 1_024 * 1_024;
+// Microsoft can leave a submitted invocation connected while producing no
+// semantic frames.  The request-wide deadline remains ten minutes for long
+// turns that keep reporting progress, but a completely idle invocation must
+// fail much sooner so Codex can surface/retry it instead of appearing frozen.
+const CHAT_PROGRESS_IDLE_TIMEOUT_MS = 90_000;
 const VARIANTS = "EnableMcpServerWidgets,feature.EnableMcpServerWidgets,feature.EnableLuForChatCIQ,feature.enableChatCIQPlugin,EnableRequestPlugins,feature.EnableSensitivityLabels,EnableUnsupportedUrlDetector,feature.IsCustomEngineCopilotEnabled,feature.bizchatfluxv3,feature.enablechatpages,feature.enableCodeCanvas,feature.turnOnWorkTabRecommendation,turnOffWorkTabUpsellFromClient,feature.turnOnDARecommendation,feature.IsStreamingModeInChatRequestEnabled,IncludeSourceAttributionsConcise,SkipPublishEmptyMessage,feature.EnableDeduplicatingSourceAttributions,Enable3PActionProgressMessages,feature.enableClientWebRtc,feature.EnableMeetingRecapOfSeriesMeetingWithCiq,feature.EnableReferencesListCompleteSignal,feature.StorageMessageSplitDisabled,feature.EnableCuaTakeControlApi,feature.cwcallowedos,feature.disabledisallowedmsgs,feature.enableCitationsForSynthesisData,feature.enableGenerateGraphicArtOptionsSet,cdximagen,feature.EnableUpdatedUXForConfirmationDialog,feature.EnableClientFileURLSupportForOfficeWebPaidCopilot,feature.EnableDesignEditorImageGrounding,feature.EnableDesignerEditor,feature.OfficeWebToHelix,feature.OfficeDesktopToHelix,feature.M365TeamsHubToHelix,feature.OwaHubToHelix,feature.MonarchHubToHelix,feature.Win32OutlookHubToHelix,feature.MacOutlookHubToHelix,Agt_bizchat_enableGpt5ForHelix";
 
 export interface ChatHubRequest {
@@ -579,7 +584,7 @@ export class ChatHubAttemptError extends Error {
  */
 export function mayFailOverChatHubFailure(cause: unknown): boolean {
   const message = failureMessage(cause).toUpperCase();
-  if (message === "REQUEST_ABORTED" || message === "CHAT_DEADLINE_EXCEEDED") return false;
+  if (message === "REQUEST_ABORTED" || message === "CHAT_DEADLINE_EXCEEDED" || message === "CHAT_PROGRESS_TIMEOUT") return false;
   if (cause instanceof ChatHubAttemptError && cause.terminalEmptyQuota) return true;
   return !(cause instanceof ChatHubAttemptError) || !cause.invocationSubmitted;
 }
@@ -612,6 +617,26 @@ export async function nextChatHubFrame(
       if (failureMessage(cause) !== "WS_READ_TIMEOUT") throw cause;
       if (Date.now() >= deadlineAt) throw new Error("CHAT_DEADLINE_EXCEEDED");
     }
+  }
+}
+
+export async function nextProgressBoundedChatHubFrame(
+  reader: Pick<SocketReader, "next">,
+  requestDeadlineAt: number,
+  progressDeadlineAt: number,
+): Promise<string> {
+  const effectiveDeadline = Math.min(requestDeadlineAt, progressDeadlineAt);
+  try {
+    return await nextChatHubFrame(reader, effectiveDeadline);
+  } catch (cause) {
+    if (
+      failureMessage(cause) === "CHAT_DEADLINE_EXCEEDED"
+      && progressDeadlineAt < requestDeadlineAt
+      && Date.now() >= progressDeadlineAt
+    ) {
+      throw new Error("CHAT_PROGRESS_TIMEOUT");
+    }
+    throw cause;
   }
 }
 
@@ -784,9 +809,11 @@ async function runChatHub(
     let throttling: unknown;
     let functionCall: FunctionCall | null = null;
     let images: string[] = [];
+    let progressDeadline = Math.min(deadline, Date.now() + CHAT_PROGRESS_IDLE_TIMEOUT_MS);
     while (Date.now() < deadline) {
-      const frame = pendingFrame || await nextChatHubFrame(reader, deadline);
+      const frame = pendingFrame || await nextProgressBoundedChatHubFrame(reader, deadline, progressDeadline);
       pendingFrame = "";
+      let semanticProgress = false;
       for (const part of frame.split(RS)) {
         if (!part.trim()) continue;
         let event: Record<string, unknown>;
@@ -795,7 +822,9 @@ async function runChatHub(
           continue;
         }
         images = appendUpstreamImageURLs(images, event);
-        functionCall ||= parseNativeFunctionCall(event, request.tools);
+        const parsedFunctionCall = parseNativeFunctionCall(event, request.tools);
+        if (!functionCall && parsedFunctionCall) semanticProgress = true;
+        functionCall ||= parsedFunctionCall;
         const type = Number(event.type ?? 0);
         if (![1, 2, 3, 6, 7].includes(type)) {
           unknownFrameTypes.add(Number.isSafeInteger(type) ? String(type) : "non_numeric");
@@ -805,6 +834,7 @@ async function runChatHub(
           continue;
         }
         if (type === 1 && event.target === "update") {
+          semanticProgress = true;
           for (const raw of (event.arguments as unknown[] | undefined) ?? []) {
             const update = raw as Record<string, unknown>;
             if (Object.hasOwn(update, "throttling")) throttling = update.throttling;
@@ -829,6 +859,7 @@ async function runChatHub(
           continue;
         }
         if (type === 2) {
+          semanticProgress = true;
           const item = event.item as Record<string, unknown> | undefined;
           if (item && Object.hasOwn(item, "throttling")) throttling = item.throttling;
           const result = item?.result as Record<string, unknown> | undefined;
@@ -864,6 +895,9 @@ async function runChatHub(
           };
         }
         if (type === 7) throw new Error(`CHAT_CLOSED_BEFORE_COMPLETION:${upstreamErrorLabel(event.error)}`);
+      }
+      if (semanticProgress) {
+        progressDeadline = Math.min(deadline, Date.now() + CHAT_PROGRESS_IDLE_TIMEOUT_MS);
       }
     }
     throw new Error("CHAT_DEADLINE_EXCEEDED");
